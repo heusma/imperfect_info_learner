@@ -152,14 +152,16 @@ class ChanceNode(Node):
             advantages[index] = advantage
 
         positive_advantages = tf.maximum(advantages, 0.0)
-        positive_advantages_sum = tf.reduce_sum(positive_advantages)
-        if positive_advantages_sum == 0:
-            target_policy = tf.constant(1 / positive_advantages.shape[0], shape=positive_advantages.shape)
-        else:
-            target_policy = positive_advantages / positive_advantages_sum
-        target_policy = tf.cast(target_policy, dtype=tf.float32)
 
-        self.distribution.optimize(list(self.children.keys()), target_policy)
+        if positive_advantages.shape[0] > 0:
+            positive_advantages_sum = tf.reduce_sum(positive_advantages)
+            if positive_advantages_sum == 0:
+                target_policy = tf.constant(1 / positive_advantages.shape[0], shape=positive_advantages.shape)
+            else:
+                target_policy = positive_advantages / positive_advantages_sum
+            target_policy = tf.cast(target_policy, dtype=tf.float32)
+
+            self.distribution.optimize(list(self.children.keys()), target_policy)
 
 
 class ActionSchema(Node):
@@ -221,6 +223,11 @@ class ActionSchema(Node):
             cn.compute_payoff(1.0)
 
         return self.root_node().compute_payoff(1.0)
+
+    def optimize(self, current_player: int, discount: float):
+        self.compute_payoff(discount)
+        for cn in self.chance_nodes:
+            cn.optimize(current_player, discount)
 
 
 class InfoSet:

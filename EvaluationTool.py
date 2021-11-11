@@ -50,7 +50,6 @@ class TabularPolicyEstimator(PolicyEstimator):
                         t_cn.payoff_estimate = s_cn.payoff_estimate
                     else:
                         distance = s_cn.payoff_estimate - t_cn.payoff_estimate
-                        tf.print(distance)
                         t_cn.payoff_estimate += self.learning_rate * distance
                     t_cn_params = t_cn.distribution.get_parameters()
                     s_cn_params = s_cn.distribution.get_parameters()
@@ -112,7 +111,7 @@ def train(game: Game, discount: float, policy_estimator: PolicyEstimator, sample
             if current_node.action_schema is None:
                 apply_estimator([current_node], policy_estimator)
             # expand the tree under the current node if max_depth not reached
-            if len(trajectory) >= max_depth:
+            if len(trajectory) > max_depth:
                 break
             rollout(current_node, samples, batch_size, policy_estimator)
             # pick the next action from unchanged distribution
@@ -126,9 +125,14 @@ def train(game: Game, discount: float, policy_estimator: PolicyEstimator, sample
         for node in reversed(trajectory):
             node.compute_payoff(discount)
 
+        # now optimize the policy in each node of the trajectory:
+        for node in reversed(trajectory):
+            node.action_schema.optimize(node.state.current_player, discount)
+
         # this is a placeholder where we train the estimator
         policy_estimator.train([node.info_set for node in trajectory], [node.action_schema for node in trajectory])
 
         # this is a grid world specific placeholder to test the estimaters quality
         if i % 1000 == 0:
+            game.test_policy(policy_estimator)
             game.show_tile_values(policy_estimator)

@@ -5,12 +5,12 @@ from typing import Tuple, List
 import tensorflow as tf
 import matplotlib.pyplot as plt
 
-from EvaluationTool import PolicyEstimator, rollout, apply_estimator
+from EvaluationTool import PolicyEstimator, rollout, apply_estimator, perform_action
 from Game import Game, StateNode, State, DiscreteDistribution, ChanceNode, InfoSet, ActionSchema, Node, Leaf
 
-size = 100
-goal_x = 20
-goal_y = 20
+size = 10
+goal_x = 3
+goal_y = 5
 
 
 class GridWorldNetwork(tf.keras.Model):
@@ -75,13 +75,13 @@ class GridWorldPolicyEstimator(PolicyEstimator):
         self.internal_network_policy = GridWorldNetwork(num_layers=2, dff=80, outputs=4)
         self.internal_network_value = GridWorldNetwork(num_layers=4, dff=80, outputs=1)
         self.optimizer_policy = tf.keras.optimizers.SGD(0.01)
-        self.optimizer_value = tf.keras.optimizers.SGD(0.01, momentum=0.9)
+        self.optimizer_value = tf.keras.optimizers.SGD(0.01)
 
     def info_set_to_vector(self, info_set: GridWorldInfoSet):
         return tf.constant([info_set.position_x / size, info_set.position_y / size], dtype=tf.float32)
 
     def vector_to_action_schema(self, vector: tf.Tensor):
-        probs = tf.constant(1/4, shape=(4,))
+        probs = vector[:4]
         payoff = vector[4:]
         distribution = DiscreteDistribution(4)
         distribution.assign(probs)
@@ -126,12 +126,12 @@ class GridWorldPolicyEstimator(PolicyEstimator):
             grads = tape.gradient(loss, tv)
             grads, _ = tf.clip_by_global_norm(grads, 1.0)
             self.optimizer_value.apply_gradients(zip(grads, tv))
-        """
+
         with tf.GradientTape() as tape:
             output_policy = self.internal_network_policy(tf.stack(batch))
 
-            policy_loss = tf.keras.losses.categorical_crossentropy(y_pred=output_policy, y_true=target_batch[:, :4])
-            tf.print(tf.reduce_mean(policy_loss))
+            policy_loss = tf.keras.losses.mean_absolute_error(y_pred=output_policy, y_true=target_batch[:, :4])
+            #tf.print(tf.reduce_mean(policy_loss))
 
             loss = tf.reduce_mean(policy_loss)
 
@@ -139,7 +139,6 @@ class GridWorldPolicyEstimator(PolicyEstimator):
             grads = tape.gradient(loss, tv)
             grads, _ = tf.clip_by_global_norm(grads, 1.0)
             self.optimizer_policy.apply_gradients(zip(grads, tv))
-        """
 
 
 class GridWorldStateNode(StateNode):
@@ -210,7 +209,7 @@ class GridWorld(Game):
             i += 1
             apply_estimator([node], policy_estimator)
             tf.print([node.state.position_x, node.state.position_y])
-            node = rollout(node)
+            _, _, _, node = perform_action(node)
             if isinstance(node, Leaf):
                 tf.print("Leaf")
         tf.print("---")

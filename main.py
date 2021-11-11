@@ -16,6 +16,6 @@ root.action_schema = root.info_set.get_action_schema()
 
 pe = GridWorldPolicyEstimator()
 
-train(GridWorld, 0.99, pe, samples=10, batch_size=1, max_depth=10, iterations=200000, game_config=dict())
+train(GridWorld, 0.99, pe, samples=20, batch_size=1, max_depth=1, iterations=200000, game_config=dict())
 
 print(root)
