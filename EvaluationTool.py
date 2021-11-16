@@ -206,3 +206,6 @@ def train_estimator(replay_buffer: ReplayBuffer, policy_estimator: PolicyEstimat
             i = 1
             sleep(10)
         policy_estimator.train(info_sets, action_schema_targets)
+
+        if i % 1 == 0:
+
