@@ -130,3 +130,6 @@ dmypy.json
 
 .idea/
 __pycache__
+
+#exclude checkpoints
+.checkpoints/
