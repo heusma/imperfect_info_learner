@@ -1,16 +1,19 @@
 import copy
+import os
 import random
+from time import sleep
 from typing import Tuple, List
 
+import jsonpickle
 import tensorflow as tf
 import matplotlib.pyplot as plt
 
 from EvaluationTool import PolicyEstimator, apply_estimator, perform_action
 from Game import Game, StateNode, State, DiscreteDistribution, ChanceNode, InfoSet, ActionSchema, Node, Leaf
 
-size = 10
-goal_x = 20
-goal_y = 50
+size = 20
+goal_x = 4
+goal_y = 4
 
 
 class GridWorldNetwork(tf.keras.Model):
@@ -18,20 +21,33 @@ class GridWorldNetwork(tf.keras.Model):
         super().__init__()
 
         self.internal_layers = []
+        self.internal_layer_norms = []
         for _ in range(num_layers):
             self.internal_layers.append(
-                tf.keras.layers.Dense(dff, activation='relu')
+                tf.keras.layers.Dense(
+                    dff,
+                    activation='relu',
+                    kernel_initializer=tf.keras.initializers.VarianceScaling(
+                        scale=2.0, mode='fan_in', distribution='truncated_normal'))
+                    )
+            self.internal_layer_norms.append(
+                tf.keras.layers.LayerNormalization()
             )
-        self.internal_layers.append(
-            tf.keras.layers.Dense(outputs, activation=None)
+        self.output_layer = tf.keras.layers.Dense(
+            outputs,
+            activation=None,
+            kernel_initializer=tf.keras.initializers.RandomUniform(minval=-0.03, maxval=0.03),
+            bias_initializer=tf.keras.initializers.Constant(-0.2)
         )
 
     @tf.function(experimental_relax_shapes=True)
     def __call__(self, input, *args, **kwargs):
         activation = input
-        for l in self.internal_layers:
-            activation = l(activation)
-        return activation
+        for i in range(len(self.internal_layers)):
+            l = self.internal_layers[i]
+            ln = self.internal_layer_norms[i]
+            activation = ln(l(activation))
+        return self.output_layer(activation)
 
 
 class GridWorldState(State):
@@ -52,9 +68,9 @@ class GridWorldActionSchema(ActionSchema):
     def __init__(self, chance_nodes: List[ChanceNode], root_node: int = 0):
         super().__init__(chance_nodes, root_node)
 
-    def sample_internal(self) -> Tuple[List[float], List[float], List[float], ChanceNode, Node]:
-        p, i, v, nn = self.root_node().sample()
-        return [p], [i], [v], self.root_node(), nn
+    def sample_internal(self):
+        p, v, nn = self.root_node().sample()
+        return [p], [v], self.root_node(), nn
 
 
 class GridWorldInfoSet(InfoSet):
@@ -72,10 +88,13 @@ class GridWorldInfoSet(InfoSet):
 
 class GridWorldPolicyEstimator(PolicyEstimator):
     def __init__(self):
-        self.internal_network_policy = GridWorldNetwork(num_layers=3, dff=80, outputs=4)
-        self.internal_network_value = GridWorldNetwork(num_layers=3, dff=80, outputs=1)
-        self.optimizer_policy = tf.keras.optimizers.SGD(0.0005, momentum=0.9)
-        self.optimizer_value = tf.keras.optimizers.SGD(0.0005, momentum=0.9)
+        self.weight_decay = 1e-4
+        self.internal_network_policy = GridWorldNetwork(num_layers=3, dff=100, outputs=4)
+        self.internal_network_value = GridWorldNetwork(num_layers=3, dff=100, outputs=1)
+        self.optimizer_policy = tf.keras.optimizers.SGD(learning_rate=0.005, momentum=0.9, nesterov=True)
+        self.optimizer_value = tf.keras.optimizers.SGD(learning_rate=0.005, momentum=0.9, nesterov=True)
+
+        self.version = 0
 
     def info_set_to_vector(self, info_set: GridWorldInfoSet):
         return tf.constant([info_set.position_x / size, info_set.position_y / size], dtype=tf.float32)
@@ -112,13 +131,17 @@ class GridWorldPolicyEstimator(PolicyEstimator):
         with tf.GradientTape() as tape:
             output_value = self.internal_network_value(tf.stack(batch))
 
-            value_loss = tf.keras.losses.mean_absolute_error(output_value, target_batch[:, 4:])
+            value_loss = tf.keras.losses.huber(y_pred=output_value, y_true=target_batch[:, 4:])
 
             loss = tf.reduce_mean(value_loss)
 
+            for weights in self.internal_network_value.get_weights():
+                loss += self.weight_decay * tf.nn.l2_loss(weights)
+
             tv = self.internal_network_value.trainable_variables
             grads = tape.gradient(loss, tv)
-            grads, _ = tf.clip_by_global_norm(grads, 1.0)
+            grads, _ = tf.clip_by_global_norm(grads, 5.0)
+
             self.optimizer_value.apply_gradients(zip(grads, tv))
 
         with tf.GradientTape() as tape:
@@ -128,10 +151,58 @@ class GridWorldPolicyEstimator(PolicyEstimator):
 
             loss = tf.reduce_mean(policy_loss)
 
+            for weights in self.internal_network_policy.get_weights():
+                loss += self.weight_decay * tf.nn.l2_loss(weights)
+
             tv = self.internal_network_policy.trainable_variables
             grads = tape.gradient(loss, tv)
-            grads, _ = tf.clip_by_global_norm(grads, 1.0)
+            grads, _ = tf.clip_by_global_norm(grads, 5.0)
             self.optimizer_policy.apply_gradients(zip(grads, tv))
+
+    def save(self, checkpoint_location: str) -> None:
+        value_net_location = os.path.dirname(checkpoint_location) + "/data/value"
+        policy_net_location = os.path.dirname(checkpoint_location) + "/data/policy"
+        checkpoint_object = jsonpickle.encode({
+            "version": random.randint(1, 10000000),
+            "value_net_location": value_net_location,
+            "policy_net_location": policy_net_location
+        })
+        success = False
+        while success is False:
+            try:
+                os.makedirs(os.path.dirname(value_net_location), exist_ok=True)
+                self.internal_network_value.save_weights(value_net_location)
+                self.internal_network_policy.save_weights(policy_net_location)
+                with open(checkpoint_location, 'w') as f:
+                    f.write(checkpoint_object)
+                success = True
+                tf.print("saved")
+            except:
+                tf.print("save error")
+                sleep(2)
+
+    def load(self, checkpoint_location: str, blocking: bool = True) -> None:
+        if self.version == 0:
+            self.internal_network_value(tf.zeros(shape=(1, 2)))
+            self.internal_network_policy(tf.zeros(shape=(1, 2)))
+        success = False
+        while success is False:
+            try:
+                with open(checkpoint_location, 'r') as f:
+                    json_object = f.read()
+                    checkpoint = jsonpickle.decode(json_object)
+                    version = checkpoint["version"]
+                    if self.version != version:
+                        tf.print("loaded new version")
+                        self.internal_network_value.load_weights(checkpoint["value_net_location"])
+                        self.internal_network_policy.load_weights(checkpoint["policy_net_location"])
+                        self.version = version
+                    success = True
+            except:
+                tf.print("load error")
+                sleep(2)
+                if blocking is False:
+                    success = True
 
 
 class GridWorldStateNode(StateNode):
@@ -203,7 +274,7 @@ class GridWorld(Game):
             apply_estimator([node], policy_estimator)
             tf.print([node.state.position_x, node.state.position_y])
             tf.print(node.action_schema.root_node().on_policy_distribution.probs)
-            _, _, _, _, node = perform_action(node)
+            _, _, _, node = perform_action(node)
             if isinstance(node, Leaf):
                 tf.print("Leaf")
         tf.print("---")

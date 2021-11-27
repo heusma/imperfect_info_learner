@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 from EvaluationTool import PolicyEstimator, apply_estimator, perform_action
 from Game import Game, StateNode, State, DiscreteDistribution, ChanceNode, InfoSet, ActionSchema, Node, Leaf
 
+rows = 6
+columns = 7
+
 
 class ConnectFourNetwork(tf.keras.Model):
     def __init__(self, num_layers: int, dff: int, outputs: int):
@@ -31,16 +34,15 @@ class ConnectFourNetwork(tf.keras.Model):
 
 
 class ConnectFourState(State):
-    def __init__(self, current_player: 0, position_x: int, position_y: int):
+    def __init__(self, current_player: 0, board: tf.Tensor):
         super().__init__(current_player)
 
-        self.position_x = position_x
-        self.position_y = position_y
+        self.board = board
 
     def to_info_set(self) -> InfoSet:
         return ConnectFourInfoSet(
-            self.position_x,
-            self.position_y,
+            self.current_player,
+            self.board,
         )
 
 
@@ -54,12 +56,12 @@ class ConnectFourActionSchema(ActionSchema):
 
 
 class ConnectFourInfoSet(InfoSet):
-    def __init__(self, position_x: int, position_y: int):
-        self.position_x = position_x
-        self.position_y = position_y
+    def __init__(self, current_player: int, board: tf.Tensor):
+        self.current_player = current_player
+        self.board = board
 
     def get_action_schema(self) -> ActionSchema:
-        cn = ChanceNode(DiscreteDistribution(4))
+        cn = ChanceNode(DiscreteDistribution(columns))
         cn.payoff_estimate = tf.zeros(shape=(1,))
         return ConnectFourActionSchema(
             [cn],
@@ -110,7 +112,7 @@ class ConnectFourPolicyEstimator(PolicyEstimator):
 
             value_loss = tf.keras.losses.mean_absolute_error(output_value, target_batch[:, 4:])
             tf.print(output_value[0])
-            #tf.print(target_batch[:, 4:][0])
+            # tf.print(target_batch[:, 4:][0])
             tf.print("value_loss:")
             tf.print(tf.reduce_mean(value_loss))
 
@@ -141,38 +143,18 @@ class ConnectFourStateNode(StateNode):
     def __init__(self, state: ConnectFourState):
         super().__init__(state)
 
-    """
-    The action is an int describing the direction of the next move.
-        0
-        |
-    3 -   - 1
-        |
-        2
-    """
-
     def act(self, action: List[int or float]) -> Tuple[List[float], StateNode or Leaf]:
         assert len(action) == 1
-        direction = action[0]
+        column = action[0]
+        assert 0 <= column <= columns
         new_state = copy.deepcopy(self.state)
         assert isinstance(new_state, ConnectFourState)
 
-        if not (new_state.position_x == goal_x and new_state.position_y == goal_y):
-            if direction == 0:
-                new_state.position_y += 1
-            if direction == 1:
-                new_state.position_x += 1
-            if direction == 2:
-                new_state.position_y -= 1
-            if direction == 3:
-                new_state.position_x -= 1
+        board = new_state.board
 
-        new_state.position_x = min(max(0, new_state.position_x), size)
-        new_state.position_y = min(max(0, new_state.position_y), size)
+        # find_valid_columns
+        for column in range(columns):
 
-        if new_state.position_x == goal_x and new_state.position_y == goal_y:
-            return tf.ones(shape=(1,)), Leaf()
-        else:
-            return tf.zeros(shape=(1,)), ConnectFourStateNode(new_state)
 
 
 class ConnectFour(Game):

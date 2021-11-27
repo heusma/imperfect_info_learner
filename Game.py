@@ -1,3 +1,4 @@
+import random
 from abc import abstractmethod
 from typing import List, Tuple
 import tensorflow as tf
@@ -27,27 +28,28 @@ class Distribution:
 
 class DiscreteDistribution(Distribution):
     def __init__(self, size: int):
-        self.probs = tf.constant(1 / size, shape=(size,))
+        self.assign(tf.constant(1 / size, shape=(size,)))
 
-    def assign(self, probs: tf.Tensor):
+    def assign(self, probs: List[float]):
         self.probs = probs
+        self.logits = tf.math.log(self.probs)
 
     def sample(self) -> Tuple[float, float or int]:
-        sample_id = tf.squeeze(
-            tf.random.categorical(tf.expand_dims(tf.math.log(self.probs), axis=0), num_samples=1)).numpy()
+        assert self.logits is not None
+        sample_id = tf.squeeze(tf.random.categorical(tf.expand_dims(self.logits, axis=0), num_samples=1)).numpy()
         probability = self.probs[sample_id]
         return probability, sample_id
 
     def get_probability(self, value: float or int) -> float:
         return self.probs[value]
 
-    def get_parameters(self) -> tf.Tensor:
+    def get_parameters(self) -> List[float]:
         return self.probs
 
-    def set_parameters(self, paramters: tf.Tensor):
+    def set_parameters(self, paramters: List[float]):
         self.assign(paramters)
 
-    def optimize(self, values: List[int or float], probabilities: List[tf.Tensor]):
+    def optimize(self, values: List[int or float], probabilities: List[float]):
         probs = [0.0] * self.probs.shape[0]
         for v, p in zip(values, probabilities):
             probs[v] = p
@@ -92,7 +94,6 @@ class Leaf(Node):
 class ChanceNode(Node):
     def __init__(self, distribution: Distribution):
         self.on_policy_distribution = distribution
-        self.off_policy_distribution: None or Distribution = None
         self.children = dict()
 
         self.payoff_estimate: List[float] or None = None
@@ -103,24 +104,19 @@ class ChanceNode(Node):
     def sample(self):
         self.computed_payoff_estimate = None
 
-        if self.off_policy_distribution is not None:
-            probability, value = self.off_policy_distribution.sample()
-            on_policy_probability = self.on_policy_distribution.get_probability(value)
-            importance = on_policy_probability / probability
-        else:
-            probability, value = self.on_policy_distribution.sample()
-            importance = 1.0
+        probability, value = self.on_policy_distribution.sample()
 
         next_node = None
         # Is this value known?
         if value in self.children:
-            look_up_probability, look_up_importance, _, _, next_node = self.children[value]
+            look_up_probability, _, _, next_node = self.children[value]
+            assert probability == look_up_probability
             # Increase visits by one.
-            self.children[value][2] += 1
-        return probability, importance, value, next_node
+            self.children[value][1] += 1
+        return probability, value, next_node
 
-    def add(self, probability: float, importance: float, value: int or float, direkt_reward: float, node: Node):
-        self.children[value] = [probability, importance, 1, direkt_reward, node]
+    def add(self, probability: float, value: int or float, direkt_reward: float, node: Node):
+        self.children[value] = [probability, 1, direkt_reward, node]
 
     def compute_payoff(self, discount):
         if self.computed_payoff_estimate is not None:
@@ -132,10 +128,10 @@ class ChanceNode(Node):
             discount = 1.0
         value = 0
         sum_visits = 0
-        for probability, importance, visits, direkt_reward, node in self.children.values():
+        for probability, visits, direkt_reward, node in self.children.values():
             upstream_payoff = node.compute_payoff(discount)
             action_value = direkt_reward + discount * upstream_payoff
-            value += visits * importance * action_value
+            value += visits * action_value
             sum_visits += visits
         if sum_visits == 0:
             payoff = tf.zeros(shape=(1,))
@@ -154,15 +150,16 @@ class ChanceNode(Node):
 
         advantages = [0.0] * len(self.children)
         for value, index in zip(self.children.keys(), range(len(self.children))):
-            _, _, _, dr, nn = self.children[value]
+            _, visits, dr, nn = self.children[value]
             assert isinstance(nn, Node)
             # remember intermediate action schema chance nodes will set their discount to 1.0 so make sure
             # that all action schema leafs were allready computed with the right discount.
             upstream_payoff = nn.compute_payoff(discount)
-            action_value = dr + discount * upstream_payoff
-            current_player_action_value = action_value[current_player]
+            action_value_computed = dr + discount * upstream_payoff
+
+            current_player_action_value = action_value_computed[current_player]
             advantage = current_player_action_value - current_player_node_value
-            advantages[index] = advantage
+            advantages[index] = advantage / visits
 
         positive_advantages = tf.maximum(advantages, 0.0)
 
