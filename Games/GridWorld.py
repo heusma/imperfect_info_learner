@@ -11,9 +11,9 @@ import matplotlib.pyplot as plt
 from EvaluationTool import PolicyEstimator, apply_estimator, perform_action
 from Game import Game, StateNode, State, DiscreteDistribution, ChanceNode, InfoSet, ActionSchema, Node, Leaf
 
-size = 20
-goal_x = 4
-goal_y = 4
+size = 10
+goal_x = 2
+goal_y = 2
 
 
 class GridWorldNetwork(tf.keras.Model):
@@ -68,8 +68,8 @@ class GridWorldActionSchema(ActionSchema):
     def __init__(self, chance_nodes: List[ChanceNode], root_node: int = 0):
         super().__init__(chance_nodes, root_node)
 
-    def sample_internal(self):
-        p, v, nn = self.root_node().sample()
+    def sample_internal(self, ghost_mode: bool = False):
+        p, v, nn = self.root_node().sample(ghost_mode)
         return [p], [v], self.root_node(), nn
 
 
@@ -179,7 +179,7 @@ class GridWorldPolicyEstimator(PolicyEstimator):
                 tf.print("saved")
             except:
                 tf.print("save error")
-                sleep(2)
+                sleep(1)
 
     def load(self, checkpoint_location: str, blocking: bool = True) -> None:
         if self.version == 0:
@@ -200,7 +200,7 @@ class GridWorldPolicyEstimator(PolicyEstimator):
                     success = True
             except:
                 tf.print("load error")
-                sleep(2)
+                sleep(10)
                 if blocking is False:
                     success = True
 
@@ -218,7 +218,7 @@ class GridWorldStateNode(StateNode):
         2
     """
 
-    def act(self, action: List[int or float]) -> Tuple[List[float], StateNode or Leaf]:
+    def act(self, action: List[int or float]) -> Tuple[tf.Tensor, StateNode or Leaf]:
         assert len(action) == 1
         direction = action[0]
         new_state = copy.deepcopy(self.state)

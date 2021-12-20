@@ -25,6 +25,11 @@ class Distribution:
     def set_parameters(self, paramters: tf.Tensor):
         pass
 
+    # Returns a gready distribution.
+    @abstractmethod
+    def gready(self) -> any:
+        pass
+
 
 class DiscreteDistribution(Distribution):
     def __init__(self, size: int):
@@ -48,6 +53,15 @@ class DiscreteDistribution(Distribution):
 
     def set_parameters(self, paramters: List[float]):
         self.assign(paramters)
+
+    def gready(self) -> Distribution:
+        self_size = self.logits.shape[0]
+        max_id = tf.argmax(self.probs)
+        gready_probs = tf.one_hot(max_id, depth=self_size)
+        res = DiscreteDistribution(self_size)
+        res.assign(gready_probs)
+        return res
+
 
     def optimize(self, values: List[int or float], probabilities: List[float]):
         probs = [0.0] * self.probs.shape[0]
@@ -101,8 +115,9 @@ class ChanceNode(Node):
 
         self.intermediate_action_schema_node: bool = False
 
-    def sample(self):
-        self.computed_payoff_estimate = None
+    def sample(self, ghost_mode: bool = False):
+        if ghost_mode is False:
+            self.computed_payoff_estimate = None
 
         probability, value = self.on_policy_distribution.sample()
 
@@ -112,11 +127,15 @@ class ChanceNode(Node):
             look_up_probability, _, _, next_node = self.children[value]
             assert probability == look_up_probability
             # Increase visits by one.
-            self.children[value][1] += 1
+            if ghost_mode is False:
+                self.children[value][1] += 1
         return probability, value, next_node
 
     def add(self, probability: float, value: int or float, direkt_reward: float, node: Node):
         self.children[value] = [probability, 1, direkt_reward, node]
+
+    def gready(self) -> any:  # -> ChanceNode
+        return ChanceNode(distribution=self.on_policy_distribution.gready())
 
     def compute_payoff(self, discount):
         if self.computed_payoff_estimate is not None:
@@ -145,7 +164,7 @@ class ChanceNode(Node):
         if self.intermediate_action_schema_node is True:
             discount = 1.0
 
-        node_value = self.payoff_estimate
+        node_value = self.computed_payoff_estimate
         current_player_node_value = node_value[current_player]
 
         advantages = [0.0] * len(self.children)
@@ -159,7 +178,15 @@ class ChanceNode(Node):
 
             current_player_action_value = action_value_computed[current_player]
             advantage = current_player_action_value - current_player_node_value
-            advantages[index] = advantage / visits
+
+            if isinstance(nn, StateNode):
+                estimated_upstream_payoff = nn.action_schema.root_node().payoff_estimate
+                current_player_action_value_estimate = estimated_upstream_payoff[current_player]
+                novelty = tf.abs(nn.compute_payoff(discount)[current_player] - current_player_action_value_estimate)
+            else:
+                novelty = 0.0
+
+            advantages[index] = advantage + novelty
 
         positive_advantages = tf.maximum(advantages, 0.0)
 
@@ -197,10 +224,17 @@ class ActionSchema(Node):
     def root_node(self):
         return self.chance_nodes[self.root_node_index]
 
-    def sample(self):
-        for cn in self.chance_nodes:
-            cn.computed_payoff_estimate = None
-        return self.sample_internal()
+    def gready(self) -> any:  # -> ActionSchema
+        num_chance_nodes = len(self.chance_nodes)
+        cns: List[ChanceNode or None] = [None] * num_chance_nodes
+        for i in range(num_chance_nodes):
+            cns[i] = self.chance_nodes[i].gready()
+        return type(self)(
+            cns, self.root_node_index,
+        )
+
+    def sample(self, ghost_mode: bool = False):
+        return self.sample_internal(ghost_mode)
 
     """
     @:returns:
@@ -212,7 +246,7 @@ class ActionSchema(Node):
     """
 
     @abstractmethod
-    def sample_internal(self) -> Tuple[List[float], List[float], List[float], ChanceNode, Node]:
+    def sample_internal(self, ghost_mode: bool = False) -> Tuple[List[float], List[float], List[float], ChanceNode, Node]:
         pass
 
     """
@@ -259,7 +293,7 @@ class StateNode(Node):
         self.action_schema: ActionSchema or None = None
 
     @abstractmethod
-    def act(self, action: List[int or float]) -> Tuple[float, Node]:
+    def act(self, action: List[int or float]) -> Tuple[tf.Tensor, Node]:
         pass
 
     def compute_payoff(self, discount):

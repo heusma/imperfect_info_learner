@@ -1,41 +1,46 @@
 import copy
 import random
 from time import sleep
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 import tensorflow as tf
 from mpi4py import MPI
 
 from EvaluationTool import gather_episodes, ReplayBuffer, train_estimator, \
     TabularPolicyEstimator
+from Games.ConnectFour import ConnectFour, ConnectFourNetwork, ConnectFourPolicyEstimator
 from Games.GridWorld import GridWorld, GridWorldPolicyEstimator
 from Games.KuhnPoker import KuhnPoker
 
+work_dir = "."
+#work_dir = os.environ["WORK"]
+
 ## config
-discount = 0.98
+discount = 0.997
 
-rollout_max_depth = 1
-rollout_sample_passes_per_state = 5
-batch_size_rollout = 20
+rollout_max_depth = 20
+rollout_sample_passes_per_state = 10
+batch_size_rollout = 10
 
-buffer_capacity = 2000
-min_buffer_training = int(0.5 * buffer_capacity)
-batch_size_training = 80
+buffer_capacity = 1000
+min_buffer_training = int(1.0 * buffer_capacity)
+batch_size_training = 100
 
 checkpoint_interval = 2000
-checkpoint_location = "./checkpoints/checkpoint_grid_world_10_net.json"
+checkpoint_location = work_dir + "/checkpoints/checkpoint_connect_4_net.json"
 ##
 
 comm = MPI.COMM_WORLD
 size = comm.Get_size()
 rank = comm.Get_rank()
 
-game_type = GridWorld
+game_type = ConnectFour
 
 rb = ReplayBuffer(capacity=buffer_capacity, rank=rank)
-pe = GridWorldPolicyEstimator()
+pe = ConnectFourPolicyEstimator()
 if rank == 0:
-    pe.load(checkpoint_location, blocking=False)
-    pe.save(checkpoint_location)
     train_estimator(
         rb,
         pe,
@@ -46,7 +51,6 @@ if rank == 0:
         game_type,
     )
 else:
-    pe.load(checkpoint_location)
     gather_episodes(
         game_type,
         discount,

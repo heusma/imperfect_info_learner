@@ -12,7 +12,7 @@ import numpy as np
 
 from mpi4py import MPI
 
-from Game import StateNode, Leaf, ActionSchema, InfoSet, Game, ChanceNode
+from Game import StateNode, Leaf, ActionSchema, InfoSet, Game, ChanceNode, DiscreteDistribution
 
 
 class PolicyEstimator:
@@ -29,6 +29,20 @@ class PolicyEstimator:
         pass
 
     @abstractmethod
+    def load(self, checkpoint_location: str, blocking: bool = True) -> None:
+        pass
+
+
+class DefaultPolicyEstimator(PolicyEstimator):
+    def __call__(self, info_sets: List[InfoSet], *args, **kwargs) -> List[ActionSchema]:
+        return [info_set.get_action_schema() for info_set in info_sets]
+
+    def train(self, info_sets: List[InfoSet], action_schema_targets: List[ActionSchema]):
+        pass
+
+    def save(self, checkpoint_location: str) -> None:
+        pass
+
     def load(self, checkpoint_location: str, blocking: bool = True) -> None:
         pass
 
@@ -121,11 +135,27 @@ class TabularPolicyEstimator(PolicyEstimator):
                     success = True
 
 
-def perform_action(node: StateNode):
-    p, v, cn, nn = node.action_schema.sample()
+def add_exploration_noise(node: StateNode):
+    root_dirichlet_alpha = 0.3
+    frac = 0.25
+
+    for cn in node.action_schema.chance_nodes:
+        assert isinstance(cn, ChanceNode)
+        dist = cn.on_policy_distribution
+        if isinstance(dist, DiscreteDistribution):
+            noise = np.random.dirichlet([root_dirichlet_alpha] * dist.logits.shape[0])
+            new_policy = tf.cast(dist.probs, dtype=tf.float32) * (1 - frac) + noise * frac
+            dist.assign(new_policy)
+        else:
+            pass
+
+
+def perform_action(node: StateNode, ghost_mode: bool = False):
+    p, v, cn, nn = node.action_schema.sample(ghost_mode)
     if nn is None:
         direkt_reward, nn = node.act(v)
-        cn.add(p[-1], v[-1], direkt_reward, nn)
+        if ghost_mode is False:
+            cn.add(p[-1], v[-1], direkt_reward, nn)
     return p, v, cn, nn
 
 
@@ -201,8 +231,13 @@ def gather_episodes(game: Type[Game], discount: float, replay_buffer: ReplayBuff
                     checkpoint_location: str,
                     samples: int, batch_size: int,
                     max_depth: int, game_config: dict):
+
+    estimator: PolicyEstimator = DefaultPolicyEstimator()
     while True:
-        policy_estimator.load(checkpoint_location)
+
+        if os.path.isfile(checkpoint_location):
+            policy_estimator.load(checkpoint_location)
+            estimator = policy_estimator
 
         root = game.start(game_config)
         current_node = root
@@ -212,34 +247,55 @@ def gather_episodes(game: Type[Game], discount: float, replay_buffer: ReplayBuff
 
             # Now estimate the current_node
             if current_node.action_schema is None:
-                apply_estimator([current_node], policy_estimator)
+                apply_estimator([current_node], estimator)
 
             if len(trajectory) >= max_depth:
                 break
 
             trajectory.append(current_node)
 
-            rollout(current_node, samples, batch_size, policy_estimator)
-            # pick the next action from unchanged distribution
-            _, _, _, next_node = perform_action(current_node)
+            # add noise to the estimated policy
+            add_exploration_noise(current_node)
+            # remove children from the current_node
+            for cn in current_node.action_schema.chance_nodes:
+                cn.children = dict()
+
+            rollout(current_node, samples, batch_size, estimator)
+
+            current_node.compute_payoff(discount)
+            current_node.action_schema.optimize(current_node.state.current_player, discount)
+
+            # compute payoff with optimized policy
+            for cn in current_node.action_schema.chance_nodes:
+                policy_sum = 0.0
+                payoff_estiamte = 0.0
+                for value in cn.children.keys():
+                    probability, visits, direkt_reward, node = cn.children[value]
+                    value_prob = cn.on_policy_distribution.get_probability(value)
+                    payoff_estiamte += value_prob * (direkt_reward + discount * node.compute_payoff(discount))
+                    policy_sum += value_prob
+                payoff_estiamte /= policy_sum
+                cn.computed_payoff_estimate = payoff_estiamte
+
+            # remove children from the current_node
+            for cn in current_node.action_schema.chance_nodes:
+                cn.children = dict()
+
+            # Sample from the optimized action schema but do not reset computed_values
+            _, _, _, next_node = perform_action(current_node, ghost_mode=True)
+
             # append it to the trajectory if not a Leaf or max_depth reached
             if isinstance(next_node, Leaf):
                 break
             current_node = next_node
-
-        # now we compute the value for each state from the bottom
-        for node in reversed(trajectory):
-            node.compute_payoff(discount)
-
-        # now optimize the policy in each node of the trajectory:
-        for node in reversed(trajectory):
-            node.action_schema.optimize(node.state.current_player, discount)
 
         info_set_result = [node.info_set for node in trajectory]
         action_schema_result = [node.action_schema for node in trajectory]
 
         for action_schema in action_schema_result:
             for cn in action_schema.chance_nodes:
+                if len(cn.children) > 0:
+                    raise AssertionError("Noooo")
                 cn.children = dict()
 
         replay_buffer.add(info_set_result, action_schema_result)
@@ -248,12 +304,13 @@ def gather_episodes(game: Type[Game], discount: float, replay_buffer: ReplayBuff
 def train_estimator(replay_buffer: ReplayBuffer, policy_estimator: PolicyEstimator, batch_size: int,
                     min_buffer_training: int,
                     checkpoint_interval: int, checkpoint_location: str, game: Type[Game]):
-    i = 1
 
+    policy_estimator.load(checkpoint_location, blocking=False)
+
+    i = 1
     # this is a grid world specific placeholder to test the estimaters quality
     tf.print(i)
-    game.test_policy(policy_estimator)
-    game.show_tile_values(policy_estimator)
+    game.test_policy_baseline(policy_estimator)
 
     while True:
         i += 1
@@ -271,7 +328,5 @@ def train_estimator(replay_buffer: ReplayBuffer, policy_estimator: PolicyEstimat
             policy_estimator.save(checkpoint_location)
             # this is a grid world specific placeholder to test the estimaters quality
             tf.print(i)
-            game.test_policy(policy_estimator)
-            game.show_tile_values(policy_estimator)
+            game.test_policy_baseline(policy_estimator)
             tf.print(len(replay_buffer.buffer))
-            # game.show_tile_values(policy_estimator)
