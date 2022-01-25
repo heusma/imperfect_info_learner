@@ -1,66 +1,48 @@
-import copy
-import random
-from time import sleep
 import os
+
+from Games.GridWorldContinuous import GridWorldContinuous, GridWorldContinuousEstimator, \
+      grid_world_continuous_exploration_function
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
-import tensorflow as tf
 from mpi4py import MPI
 
-from EvaluationTool import gather_episodes, ReplayBuffer, train_estimator, \
-    TabularPolicyEstimator
-from Games.ConnectFour import ConnectFour, ConnectFourNetwork, ConnectFourPolicyEstimator
-from Games.GridWorld import GridWorld, GridWorldPolicyEstimator
-from Games.KuhnPoker import KuhnPoker
+from EvaluationTool import train, identity_exploration_function
+from Games.GridWorld import GridWorld, GridWorldEstimator, grid_world_exploration_function
 
 work_dir = "."
 #work_dir = os.environ["WORK"]
-
-## config
-discount = 0.997
-
-rollout_max_depth = 20
-rollout_sample_passes_per_state = 10
-batch_size_rollout = 10
-
-buffer_capacity = 1000
-min_buffer_training = int(1.0 * buffer_capacity)
-batch_size_training = 100
-
-checkpoint_interval = 2000
-checkpoint_location = work_dir + "/checkpoints/checkpoint_connect_4_net.json"
-##
 
 comm = MPI.COMM_WORLD
 size = comm.Get_size()
 rank = comm.Get_rank()
 
-game_type = ConnectFour
+## config
+game = GridWorldContinuous
+discount = 0.99
+max_steps = 40
+horizon = 4
+num_trajectory_samples = 1
+max_targets_per_trajectory = 20
+num_additional_unroll_samples_per_visited_state = 2
 
-rb = ReplayBuffer(capacity=buffer_capacity, rank=rank)
-pe = ConnectFourPolicyEstimator()
-if rank == 0:
-    train_estimator(
-        rb,
-        pe,
-        batch_size_training,
-        min_buffer_training,
-        checkpoint_interval,
-        checkpoint_location,
-        game_type,
-    )
-else:
-    gather_episodes(
-        game_type,
-        discount,
-        rb,
-        pe,
-        checkpoint_location,
-        samples=rollout_sample_passes_per_state,
-        batch_size=batch_size_rollout,
-        max_depth=rollout_max_depth,
-        game_config=dict()
-    )
+estimator = GridWorldContinuousEstimator()
+batch_size = 40
+
+exploration_function = grid_world_continuous_exploration_function
+p = 10
+c = 1
+r = c
+
+test_interval = 100
+checkpoint_interval = 400
+checkpoint_path = work_dir + "/checkpoints/checkpoint_grid_world.json"
+##
+
+estimator.load(checkpoint_path, blocking=False)
+
+train(game, discount, max_steps, horizon, num_trajectory_samples, max_targets_per_trajectory,
+      num_additional_unroll_samples_per_visited_state, estimator,
+      batch_size, exploration_function, p, c, r, rank, size, test_interval, checkpoint_interval, checkpoint_path)
 
 MPI.Finalize()

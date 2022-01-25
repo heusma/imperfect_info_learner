@@ -1,27 +1,30 @@
-import copy
-import os
 import random
+import time
 from abc import abstractmethod
-from threading import Thread
-from time import sleep
-from typing import List, Callable, Tuple, Type
+from typing import Tuple, Callable, List, Type
 
-import jsonpickle
-import tensorflow as tf
 import numpy as np
-
+import tensorflow as tf
 from mpi4py import MPI
 
-from Game import StateNode, Leaf, ActionSchema, InfoSet, Game, ChanceNode, DiscreteDistribution
+from MDP import State, InfoSet, Leaf, Game, ActionSchema
+
+QValueTarget = Tuple[tf.Tensor, tf.Tensor, tf.Tensor]
+VTraceTarget = Tuple[InfoSet, float, tf.Tensor, List[QValueTarget]]
+VTraceGradients = Tuple[List[tf.Tensor], List[tf.Tensor]]
 
 
-class PolicyEstimator:
+class Estimator:
     @abstractmethod
-    def __call__(self, info_sets: List[InfoSet], *args, **kwargs) -> List[ActionSchema]:
+    def evaluate(self, info_sets: List[InfoSet]) -> List[Tuple[tf.Tensor, ActionSchema]]:
         pass
 
     @abstractmethod
-    def train(self, info_sets: List[InfoSet], action_schema_targets: List[ActionSchema]):
+    def compute_gradients(self, targets: List[VTraceTarget]) -> VTraceGradients:
+        pass
+
+    @abstractmethod
+    def apply_gradients(self, grads: VTraceGradients):
         pass
 
     @abstractmethod
@@ -33,300 +36,435 @@ class PolicyEstimator:
         pass
 
 
-class DefaultPolicyEstimator(PolicyEstimator):
-    def __call__(self, info_sets: List[InfoSet], *args, **kwargs) -> List[ActionSchema]:
-        return [info_set.get_action_schema() for info_set in info_sets]
-
-    def train(self, info_sets: List[InfoSet], action_schema_targets: List[ActionSchema]):
-        pass
-
-    def save(self, checkpoint_location: str) -> None:
-        pass
-
-    def load(self, checkpoint_location: str, blocking: bool = True) -> None:
-        pass
+def identity_exploration_function(action_schema: ActionSchema) -> ActionSchema:
+    return action_schema
 
 
-def to_key(info_set: InfoSet):
-    return str(list(info_set.__dict__.values()))
+# [state, info_set, value_estimate, action_schema_estimate, off_policy_action_schema,
+#                 on_policy_probability, off_policy_probability, action, direct_reward]
+TrajectoryElement = Tuple[State, InfoSet, tf.Tensor, ActionSchema, ActionSchema, float, float, tf.Tensor, float]
+Trajectory = List[TrajectoryElement or Leaf]
 
 
-class TabularPolicyEstimator(PolicyEstimator):
-    def __init__(self, learning_rate: float):
-        self.learning_rate = learning_rate
-        self.table = dict()
-
-        self.version: int = 0
-
-    def __call__(self, info_sets: List[InfoSet], *args, **kwargs) -> List[ActionSchema]:
-        results: List[None or ActionSchema] = [None] * len(info_sets)
-        for id in range(len(info_sets)):
-            info_set = info_sets[id]
-            key = to_key(info_set)
-            if key in self.table:
-                results[id] = copy.deepcopy(self.table[key])
-            else:
-                results[id] = info_set.get_action_schema()
-                self.table[key] = copy.deepcopy(results[id])
-        return results
-
-    def train(self, info_sets: List[InfoSet], action_schema_targets: List[ActionSchema]):
-        for info_set, policy_target in zip(info_sets, action_schema_targets):
-            key = to_key(info_set)
-            if key in self.table:
-                p = self.table[key]
-                assert isinstance(p, ActionSchema)
-                for t_cn, s_cn in zip(p.chance_nodes, policy_target.chance_nodes):
-                    s_cn.payoff_estimate = s_cn.computed_payoff_estimate
-                    if t_cn.payoff_estimate is None:
-                        t_cn.payoff_estimate = s_cn.payoff_estimate
-                    else:
-                        distance = s_cn.payoff_estimate - t_cn.payoff_estimate
-                        t_cn.payoff_estimate += self.learning_rate * distance
-                    t_cn_params = t_cn.on_policy_distribution.get_parameters()
-                    s_cn_params = s_cn.on_policy_distribution.get_parameters()
-                    t_cn_params += self.learning_rate * (s_cn_params - t_cn_params)
-                    t_cn.on_policy_distribution.set_parameters(t_cn_params)
-            else:
-                policy_target_copy = copy.deepcopy(policy_target)
-                for cn in policy_target_copy.chance_nodes:
-                    cn.children = dict()
-                self.table[key] = policy_target_copy
-
-    def save(self, checkpoint_location: str) -> None:
-        json_object = jsonpickle.encode(self)
-        data_location = os.path.dirname(checkpoint_location) + "/data/checkpoint.json"
-        checkpoint_object = jsonpickle.encode({"version": random.randint(1, 10000000), "data_location": data_location})
-        success = False
-        while success is False:
-            try:
-                os.makedirs(os.path.dirname(data_location), exist_ok=True)
-                with open(data_location, 'w') as f:
-                    f.write(json_object)
-                with open(checkpoint_location, 'w') as f:
-                    f.write(checkpoint_object)
-                success = True
-                tf.print("saved")
-            except IOError:
-                tf.print("save error")
-                sleep(2)
-
-    def load(self, checkpoint_location: str, blocking: bool = True) -> None:
-        success = False
-        while success is False:
-            try:
-                with open(checkpoint_location, 'r') as f:
-                    json_object = f.read()
-                    checkpoint = jsonpickle.decode(json_object)
-                    version = checkpoint["version"]
-                    if self.version != version:
-                        with open(checkpoint["data_location"], 'r') as f2:
-                            tf.print("loaded new version")
-                            json_object = f2.read()
-                            loaded_pe_instance = jsonpickle.decode(json_object)
-                            self.learning_rate = loaded_pe_instance.learning_rate
-                            self.table = loaded_pe_instance.table
-                            self.version = version
-                    success = True
-            except IOError:
-                tf.print("load error")
-                sleep(2)
-                if blocking is False:
-                    success = True
+def take_action(game: Type[Game], state: State, info_set: InfoSet, on_policy_action_schema: ActionSchema,
+                off_policy_action_schema: ActionSchema):
+    off_policy_probability, action = off_policy_action_schema.sample()
+    on_policy_probability = on_policy_action_schema.prob(action)
+    state, info_set, direct_reward = game.act(state, info_set, action)
+    return on_policy_probability, off_policy_probability, action, direct_reward, state, info_set
 
 
-def add_exploration_noise(node: StateNode):
-    root_dirichlet_alpha = 0.3
-    frac = 0.25
+def create_trajectory(game: Type[Game], state: State, info_set: InfoSet, estimator: Estimator,
+                      exploration_function: Callable,
+                      max_steps: int):
+    trajectory: Trajectory = []
+    while len(trajectory) < max_steps:
+        value_estimate, action_schema_estimate = estimator.evaluate([info_set])[0]
+        off_policy_action_schema = exploration_function(action_schema_estimate)
+        on_policy_probability, off_policy_probability, action, direct_reward, new_state, new_info_set = \
+            take_action(game, state, info_set, action_schema_estimate, off_policy_action_schema)
+        trajectory.append(
+            (
+                state, info_set, value_estimate, action_schema_estimate, off_policy_action_schema,
+                on_policy_probability, off_policy_probability, action, direct_reward
+            )
+        )
+        state, info_set = new_state, new_info_set
 
-    for cn in node.action_schema.chance_nodes:
-        assert isinstance(cn, ChanceNode)
-        dist = cn.on_policy_distribution
-        if isinstance(dist, DiscreteDistribution):
-            noise = np.random.dirichlet([root_dirichlet_alpha] * dist.logits.shape[0])
-            new_policy = tf.cast(dist.probs, dtype=tf.float32) * (1 - frac) + noise * frac
-            dist.assign(new_policy)
-        else:
-            pass
+        if isinstance(state, Leaf):
+            trajectory.append(Leaf())
+            break
 
-
-def perform_action(node: StateNode, ghost_mode: bool = False):
-    p, v, cn, nn = node.action_schema.sample(ghost_mode)
-    if nn is None:
-        direkt_reward, nn = node.act(v)
-        if ghost_mode is False:
-            cn.add(p[-1], v[-1], direkt_reward, nn)
-    return p, v, cn, nn
-
-
-def rollout_internal(root: StateNode) -> StateNode or Leaf:
-    node = root
-    while isinstance(node, Leaf) is False and node.action_schema is not None:
-        p, v, cn, nn = perform_action(node)
-        node = nn
-    assert isinstance(node, StateNode) or isinstance(node, Leaf)
-    return node
+    return trajectory
 
 
-def rollout(state_node: StateNode, iterations: int, batch_size: int, policy_estimator: PolicyEstimator):
-    for _ in range(iterations):
-        batch = []
-        for _ in range(batch_size):
-            rollout_leaf = rollout_internal(state_node)
-            if isinstance(rollout_leaf, StateNode):
-                batch.append(rollout_leaf)
-        apply_estimator(batch, policy_estimator)
-    return state_node
+state_info_pair_information = Tuple[State, InfoSet, tf.Tensor, ActionSchema, ActionSchema] or None
 
 
-def apply_estimator(batch: List[StateNode], policy_estimator: PolicyEstimator):
-    if len(batch) == 0:
-        return
-    info_set_batch = [batch_item.info_set for batch_item in batch]
-    estimated_policies = policy_estimator(info_set_batch)
-    for id in range(len(batch)):
-        batch_item = batch[id]
-        batch_item.action_schema = estimated_policies[id]
+# SPEED UP THIS PART!!!!
+def gather_unrolls(game: Type[Game], start: TrajectoryElement, num_samples: int, batch_size: int, estimator: Estimator,
+                   exploration_function: Callable,
+                   max_steps: int):
+    state, info_set, value_estimate, on_policy_action_schema, off_policy_action_schema, on_policy_probability, off_policy_probability, action, direct_reward = \
+        start
 
+    unrolls: List[Trajectory] = []
+    current_state_info_pairs: List[state_info_pair_information] = [(state, info_set, value_estimate,
+                                                                    on_policy_action_schema,
+                                                                    off_policy_action_schema)] * num_samples
+    for _ in range(num_samples):
+        unrolls.append([])
 
-class ReplayBuffer:
-    def __init__(self, capacity: int, rank: int):
-        self.capacity = capacity
-        self.buffer = []
-
-        self.rank = rank
-        if self.rank == 0:
-            self.start_message_watcher()
-
-    def add(self, info_sets: List[InfoSet], action_schema_targets: List[ActionSchema]):
-        if self.rank == 0:
-            for info_set, action_schema_target in zip(info_sets, action_schema_targets):
-                if len(self.buffer) > self.capacity:
-                    self.buffer.pop(0)
-                self.buffer.append(
-                    (info_set, action_schema_target)
+    k = 0
+    while True:
+        evaluation_worklist: List[Tuple[int, State, InfoSet]] = []
+        # sample one action for each rollout path
+        for j in range(num_samples):
+            current_state_info_pair = current_state_info_pairs[j]
+            if current_state_info_pair is None:
+                continue
+            state, info_set, value_estimate, on_policy_action_schema, off_policy_action_schema = \
+                current_state_info_pairs[j]
+            on_policy_probability, off_policy_probability, action, direct_reward, new_state, new_info_set = \
+                take_action(game, state, info_set, on_policy_action_schema, off_policy_action_schema)
+            unrolls[j].append(
+                (
+                    state, info_set, value_estimate, on_policy_action_schema, off_policy_action_schema,
+                    on_policy_probability, off_policy_probability, action, direct_reward
                 )
-        else:
-            MPI.COMM_WORLD.send((info_sets, action_schema_targets), dest=0, tag=0)
+            )
+            # gather new_info_sets in the evaluation_worklist for batch processing.
+            if isinstance(new_info_set, Leaf):
+                current_state_info_pairs[j] = None
+                unrolls[j].append(Leaf())
+            else:
+                evaluation_worklist.append((j, new_state, new_info_set))
 
-    def fetch(self, batch_size: int) -> Tuple[List[InfoSet] or None, List[ActionSchema] or None]:
-        if len(self.buffer) < batch_size:
-            return None, None
-        samples = random.sample(self.buffer, batch_size)
-        info_sets, action_schema_targets = zip(*samples)
-        return info_sets, action_schema_targets
+        k += 1
+        if k == max_steps:
+            break
 
-    def watch_messages(self):
-        while True:
-            info_sets, action_schema_targets = MPI.COMM_WORLD.recv(tag=0)
-            self.add(info_sets, action_schema_targets)
+        # group worklist into batches and compute estimates
+        worklist_pointer = 0
+        while worklist_pointer < len(evaluation_worklist):
+            batch = evaluation_worklist[worklist_pointer:worklist_pointer + batch_size]
+            worklist_pointer += batch_size
+            id_batch, state_batch, info_set_batch = zip(*batch)
+            value_estimates, on_policy_action_schemas = zip(*estimator.evaluate(info_set_batch))
+            off_policy_action_schemas = [exploration_function(action_schema) for action_schema in
+                                         on_policy_action_schemas]
+            for z in range(len(id_batch)):
+                id = id_batch[z]
+                current_state_info_pairs[id] = (
+                    state_batch[z], info_set_batch[z], value_estimates[z], on_policy_action_schemas[z],
+                    off_policy_action_schemas[z]
+                )
 
-    def start_message_watcher(self):
-        thread = Thread(target=self.watch_messages)
-        thread.start()
-        return thread
+    return unrolls
 
 
-def gather_episodes(game: Type[Game], discount: float, replay_buffer: ReplayBuffer, policy_estimator: PolicyEstimator,
-                    checkpoint_location: str,
-                    samples: int, batch_size: int,
-                    max_depth: int, game_config: dict):
+def trajectory_to_vtrace_targets(trajectory: Trajectory, discount: float, p: float, c: float):
+    # first compute v_s for each state
+    value_targets: List[tf.Tensor] = [tf.zeros(shape=())] * (len(trajectory) - 1)
+    q_value_targets = [tf.zeros(shape=())] * (len(trajectory) - 1)
 
-    estimator: PolicyEstimator = DefaultPolicyEstimator()
+    te = trajectory[-1]
+    if isinstance(te, Leaf):
+        v_s_nn = 0.0
+        value_estimate_nn = 0.0
+    else:
+        _, _, v_s_nn, _, _, _, _, _, _ = trajectory[-1]
+        value_estimate_nn = v_s_nn
+
+    for i in reversed(range(len(trajectory) - 1)):
+        _, _, value_estimate_cn, _, _, on_policy_probability, off_policy_probability, _, direct_reward = trajectory[i]
+
+        importance_weight = on_policy_probability / off_policy_probability
+        p_t = tf.minimum(p, importance_weight)
+        c_t = tf.minimum(c, importance_weight)
+
+        td = p_t * (direct_reward + discount * value_estimate_nn - value_estimate_cn)
+        v_s = value_estimate_cn + td + discount * c_t * (v_s_nn - value_estimate_nn)
+
+        value_targets[i] = v_s
+
+        q_s = direct_reward + discount * v_s_nn
+        q_value_targets[i] = q_s
+
+        v_s_nn = v_s
+        value_estimate_nn = value_estimate_cn
+
+    return zip(value_targets, q_value_targets)
+
+
+def valid_q_target(importance: tf.Tensor, q_value: tf.Tensor):
+    tmp = tf.concat([importance, q_value], axis=0)
+    return not (tf.reduce_any(tf.math.is_nan(tmp)) or tf.reduce_any(tf.math.is_inf(tmp)))
+
+
+def valid_v_trace_target(reach_importance_weight, mean_value_target, q_value_targets):
+    if len(q_value_targets) == 0:
+        return False
+    tmp = tf.concat([reach_importance_weight, tf.squeeze(mean_value_target)], axis=0)
+    return not (tf.reduce_any(tf.math.is_nan(tmp)) or tf.reduce_any(tf.math.is_inf(tmp)))
+
+
+def analyse(game: Type[Game], trajectory: Trajectory,
+            max_targets_per_trajectory: int,
+            num_samples: int,
+            batch_size: int,
+            estimator: Estimator,
+            exploration_function: Callable,
+            max_steps: int,
+            discount: float,
+            r: float,
+            p: float,
+            c: float) -> List[VTraceTarget]:
+    on_policy_reach = 1.0
+    off_policy_reach = 1.0
+    trajectory_v_trace_targets = []
+
+    chosen_elements = range(len(trajectory) - 1)
+    if len(chosen_elements) > max_targets_per_trajectory:
+        chosen_elements = random.sample(chosen_elements, max_targets_per_trajectory)
+    for i in chosen_elements:
+
+        trajectory_element = trajectory[i]
+        _, info_set, _, _, _, on_policy_probability, off_policy_probability, _, _ = trajectory_element
+
+        on_policy_reach *= on_policy_probability
+        off_policy_reach *= off_policy_probability
+        reach_importance_weight = tf.minimum(r, on_policy_reach / off_policy_reach)
+
+        unrolls = gather_unrolls(game, trajectory_element, num_samples, batch_size, estimator, exploration_function,
+                                 max_steps)
+
+        if len(trajectory) - i >= max_steps:
+            unroll_from_outer_trajectory = []
+            for u in range(max_steps):
+                unroll_from_outer_trajectory.append(
+                    trajectory[i + u]
+                )
+            if len(trajectory) > i + max_steps and isinstance(trajectory[i + max_steps], Leaf):
+                unroll_from_outer_trajectory.append(Leaf())
+            unrolls.append(unroll_from_outer_trajectory)
+
+        v_trace_targets = [
+            list(trajectory_to_vtrace_targets(unroll, discount, p, c))[0] for unroll in unrolls
+        ]
+
+        mean_value_target = tf.zeros(shape=())
+        q_value_targets = []
+        for j in range(num_samples):
+            value_target, q_value_target = v_trace_targets[j]
+            mean_value_target += value_target
+            _, _, _, _, _, on_policy_probability, off_policy_probability, action, _ = unrolls[j][0]
+            imp = tf.minimum(p, on_policy_probability / off_policy_probability)
+            if valid_q_target(imp, q_value_target[info_set.current_player]):
+                q_value_targets.append(
+                    (
+                        action,
+                        imp,
+                        q_value_target[info_set.current_player],
+                    )
+                )
+        mean_value_target /= num_samples
+
+        if valid_v_trace_target(reach_importance_weight, mean_value_target, q_value_targets):
+            trajectory_v_trace_targets.append(
+                (info_set, reach_importance_weight, mean_value_target, q_value_targets)
+            )
+
+    return trajectory_v_trace_targets
+
+
+def compute_gradient_mean(grads: List[VTraceGradients]) -> VTraceGradients:
+    result = [None, None]
+    for grad_pair in grads:
+        for i in range(2):
+            if result[i] is None:
+                result[i] = grad_pair[i]
+            else:
+                result[i] = [
+                    result[i][z] + grad_pair[i][z] for z in range(len(result[i]))
+                ]
+
+    for i in range(2):
+        for j in range(len(result[i])):
+            result[i][j] /= len(grads)
+
+    v_grads, p_grads = result
+    return v_grads, p_grads
+
+
+def get_gradient_from_targets(targets: List[VTraceTarget], batch_size: int, estimator: Estimator) -> VTraceGradients:
+    worklist_pointer = 0
+    gradients = []
+    while worklist_pointer < len(targets):
+        batch = targets[worklist_pointer:worklist_pointer + batch_size]
+        worklist_pointer += batch_size
+        local_grads = estimator.compute_gradients(batch)
+        gradients.append(local_grads)
+
+    return compute_gradient_mean(gradients)
+
+
+def flatten_gradients(gradients: VTraceGradients):
+    shapes = ([], [])
+    grad_values = []
+    for i in range(2):
+        grads = gradients[i]
+        for g in grads:
+            shapes[i].append(tf.shape(g))
+            grad_values.append(
+                tf.reshape(g, shape=(-1,))
+            )
+
+    grad_values = tf.concat(grad_values, axis=0)
+
+    return grad_values, shapes
+
+
+def reshape_gradient_values(gradient_values: tf.Tensor, shapes: Tuple[List[tf.TensorShape], List[tf.TensorShape]]):
+    gradients = ([], [])
+    pointer = 0
+    for i in range(2):
+        grads = gradients[i]
+        l_shapes = shapes[i]
+        for j in range(len(l_shapes)):
+            shape = l_shapes[j]
+            element_count = tf.reduce_prod(shape)
+            grads.append(
+                tf.reshape(
+                    gradient_values[pointer:pointer + element_count],
+                    shape
+                )
+            )
+            pointer += element_count
+
+    return gradients
+
+
+def split_equal(a: np.array, n: int) -> List[np.array]:
+    k, m = divmod(len(a), n)
+    return list((a[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)))
+
+
+def ring_all_reduce(gradient_values: tf.Tensor, rank: int, size: int) -> tf.Tensor:
+    gradient_values_numpy = gradient_values.numpy()
+    n_d_type = MPI.FLOAT
+
+    destination = (rank + 1) % size
+    source = (rank - 1) % size
+
+    partitions = split_equal(gradient_values_numpy, size)
+
+    # first_ring
+    i = rank
+    for _ in range(size - 1):
+        prev_rank = (i - 1) % size
+
+        MPI.COMM_WORLD.Send([partitions[i], n_d_type], dest=destination)
+
+        reduced_partition = np.empty(partitions[prev_rank].size, dtype='f')
+        MPI.COMM_WORLD.Recv([reduced_partition, MPI.FLOAT], source=source)
+
+        partitions[prev_rank] = partitions[prev_rank] + reduced_partition
+
+        i = prev_rank
+
+    partitions[i] = partitions[i] / size
+
+    # second_ring
+    for _ in range(size - 1):
+        prev_rank = (i - 1) % size
+
+        MPI.COMM_WORLD.Send([partitions[i], n_d_type], dest=destination)
+
+        reduced_partition = np.empty(partitions[prev_rank].size, dtype='f')
+        MPI.COMM_WORLD.Recv([reduced_partition, MPI.FLOAT], source=source)
+
+        partitions[prev_rank] = reduced_partition
+
+        i = prev_rank
+
+    result = tf.convert_to_tensor(
+        np.concatenate(partitions, axis=0),
+        dtype=tf.float32,
+    )
+
+    return result
+
+
+def sync_gradients(rank: int, size: int, gradients: VTraceGradients) -> VTraceGradients:
+    if size == 1:
+        return gradients
+
+    gradient_values, shapes = flatten_gradients(gradients)
+
+    allreduce_gradient_values = ring_all_reduce(gradient_values, rank, size)
+
+    gradients = reshape_gradient_values(allreduce_gradient_values, shapes)
+
+    return gradients
+
+
+def filter_invalid_gradients(gradients: VTraceGradients) -> VTraceGradients:
+    for i in range(2):
+        contains_nan = False
+        grads = gradients[i]
+        for j in range(len(grads)):
+            g = grads[j]
+            if tf.reduce_any(tf.math.is_nan(g)) or tf.reduce_any(tf.math.is_inf(g)):
+                contains_nan = True
+                grads[j] = tf.zeros_like(grads[j])
+        if contains_nan:
+            tf.print("filtered nan values!")
+    return gradients
+
+
+def train(game: Type[Game],
+          discount: float,
+          max_steps: int,
+          horizon: int,
+          num_trajectory_samples: int,
+          max_targets_per_trajectory: int,
+          num_unroll_samples_per_visited_state: int,
+          estimator: Estimator,
+          batch_size: int,
+          exploration_function: Callable,
+          p: float,
+          c: float,
+          r: float,
+          rank: int,
+          size: int,
+          test_interval: int,
+          checkpoint_interval: int,
+          checkpoint_path: str,
+          ):
+    i = 0
     while True:
+        start_t = time.time()
+        gradients = []
+        for _ in range(num_trajectory_samples):
+            root_s, root_i = game.get_root()
 
-        if os.path.isfile(checkpoint_location):
-            policy_estimator.load(checkpoint_location)
-            estimator = policy_estimator
+            trajectory = create_trajectory(game=game, state=root_s, info_set=root_i, estimator=estimator,
+                                           exploration_function=exploration_function,
+                                           max_steps=max_steps)
 
-        root = game.start(game_config)
-        current_node = root
-        trajectory = []
-        while True:
-            assert isinstance(current_node, StateNode)
+            targets = analyse(game, trajectory, max_targets_per_trajectory,
+                              num_samples=num_unroll_samples_per_visited_state, batch_size=batch_size,
+                              estimator=estimator, exploration_function=exploration_function, max_steps=horizon,
+                              discount=discount, p=p, c=c, r=r)
 
-            # Now estimate the current_node
-            if current_node.action_schema is None:
-                apply_estimator([current_node], estimator)
+            if len(targets) == 0:
+                continue
 
-            if len(trajectory) >= max_depth:
-                break
+            local_gradients = get_gradient_from_targets(targets, batch_size=batch_size, estimator=estimator)
 
-            trajectory.append(current_node)
+            local_gradients = filter_invalid_gradients(local_gradients)
 
-            # add noise to the estimated policy
-            add_exploration_noise(current_node)
-            # remove children from the current_node
-            for cn in current_node.action_schema.chance_nodes:
-                cn.children = dict()
+            gradients.append(local_gradients)
 
-            rollout(current_node, samples, batch_size, estimator)
-
-            current_node.compute_payoff(discount)
-            current_node.action_schema.optimize(current_node.state.current_player, discount)
-
-            # compute payoff with optimized policy
-            for cn in current_node.action_schema.chance_nodes:
-                policy_sum = 0.0
-                payoff_estiamte = 0.0
-                for value in cn.children.keys():
-                    probability, visits, direkt_reward, node = cn.children[value]
-                    value_prob = cn.on_policy_distribution.get_probability(value)
-                    payoff_estiamte += value_prob * (direkt_reward + discount * node.compute_payoff(discount))
-                    policy_sum += value_prob
-                payoff_estiamte /= policy_sum
-                cn.computed_payoff_estimate = payoff_estiamte
-
-            # remove children from the current_node
-            for cn in current_node.action_schema.chance_nodes:
-                cn.children = dict()
-
-            # Sample from the optimized action schema but do not reset computed_values
-            _, _, _, next_node = perform_action(current_node, ghost_mode=True)
-
-            # append it to the trajectory if not a Leaf or max_depth reached
-            if isinstance(next_node, Leaf):
-                break
-            current_node = next_node
-
-        info_set_result = [node.info_set for node in trajectory]
-        action_schema_result = [node.action_schema for node in trajectory]
-
-        for action_schema in action_schema_result:
-            for cn in action_schema.chance_nodes:
-                if len(cn.children) > 0:
-                    raise AssertionError("Noooo")
-                cn.children = dict()
-
-        replay_buffer.add(info_set_result, action_schema_result)
-
-
-def train_estimator(replay_buffer: ReplayBuffer, policy_estimator: PolicyEstimator, batch_size: int,
-                    min_buffer_training: int,
-                    checkpoint_interval: int, checkpoint_location: str, game: Type[Game]):
-
-    policy_estimator.load(checkpoint_location, blocking=False)
-
-    i = 1
-    # this is a grid world specific placeholder to test the estimaters quality
-    tf.print(i)
-    game.test_policy_baseline(policy_estimator)
-
-    while True:
-        i += 1
-
-        info_sets, action_schema_targets = replay_buffer.fetch(batch_size)
-        if info_sets is None or len(replay_buffer.buffer) < min_buffer_training:
-            i = 1
-            tf.print("sleep")
-            tf.print(len(replay_buffer.buffer))
-            sleep(10)
+        if len(gradients) == 0:
+            tf.print("loop again caused by missing gradients.")
             continue
-        policy_estimator.train(info_sets, action_schema_targets)
 
-        if i % checkpoint_interval == 0:
-            policy_estimator.save(checkpoint_location)
-            # this is a grid world specific placeholder to test the estimaters quality
-            tf.print(i)
-            game.test_policy_baseline(policy_estimator)
-            tf.print(len(replay_buffer.buffer))
+        gradients = compute_gradient_mean(gradients)
+
+        gradients = sync_gradients(rank, size, gradients)
+
+        estimator.apply_gradients(gradients)
+
+        i += 1
+        if rank == 0:
+            if i % test_interval == 0:
+                tf.print(f'{int(i / test_interval)} test in this session.')
+                game.test_performance(estimator)
+            if i % checkpoint_interval == 0:
+                tf.print(f'{int(i / checkpoint_interval)} savepoint in this session.')
+                estimator.save(checkpoint_path)
+
+        end_t = time.time()
+        tf.print(f'one iteration took: {end_t - start_t}')
