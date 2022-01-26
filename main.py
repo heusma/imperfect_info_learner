@@ -2,6 +2,7 @@ import os
 
 from Games.GridWorldContinuous import GridWorldContinuous, GridWorldContinuousEstimator, \
       grid_world_continuous_exploration_function
+from Games.financial_model.Games.stock_world import StockWorld, stock_world_exploration_function, StockWorldEstimator
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
@@ -18,25 +19,25 @@ size = comm.Get_size()
 rank = comm.Get_rank()
 
 ## config
-game = GridWorldContinuous
-discount = 0.99
+game = GridWorld
+discount = 0.9
 max_steps = 40
 horizon = 4
 num_trajectory_samples = 1
 max_targets_per_trajectory = 20
 num_additional_unroll_samples_per_visited_state = 2
 
-estimator = GridWorldContinuousEstimator()
+estimator = GridWorldEstimator()
 batch_size = 40
 
-exploration_function = grid_world_continuous_exploration_function
+exploration_function = grid_world_exploration_function
 p = 10
 c = 1
 r = c
 
 test_interval = 100
-checkpoint_interval = 400
-checkpoint_path = work_dir + "/checkpoints/checkpoint_grid_world.json"
+checkpoint_interval = 100
+checkpoint_path = work_dir + "/checkpoints/checkpoint_stock_world.json"
 ##
 
 estimator.load(checkpoint_path, blocking=False)

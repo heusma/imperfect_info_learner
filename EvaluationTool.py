@@ -344,10 +344,12 @@ def ring_all_reduce(gradient_values: tf.Tensor, rank: int, size: int) -> tf.Tens
     for _ in range(size - 1):
         prev_rank = (i - 1) % size
 
-        MPI.COMM_WORLD.Send([partitions[i], n_d_type], dest=destination)
+        send_request = MPI.COMM_WORLD.Isend([partitions[i], n_d_type], dest=destination)
 
         reduced_partition = np.empty(partitions[prev_rank].size, dtype='f')
         MPI.COMM_WORLD.Recv([reduced_partition, MPI.FLOAT], source=source)
+
+        send_request.wait()
 
         partitions[prev_rank] = partitions[prev_rank] + reduced_partition
 
@@ -359,10 +361,12 @@ def ring_all_reduce(gradient_values: tf.Tensor, rank: int, size: int) -> tf.Tens
     for _ in range(size - 1):
         prev_rank = (i - 1) % size
 
-        MPI.COMM_WORLD.Send([partitions[i], n_d_type], dest=destination)
+        send_request = MPI.COMM_WORLD.Isend([partitions[i], n_d_type], dest=destination)
 
         reduced_partition = np.empty(partitions[prev_rank].size, dtype='f')
         MPI.COMM_WORLD.Recv([reduced_partition, MPI.FLOAT], source=source)
+
+        send_request.wait()
 
         partitions[prev_rank] = reduced_partition
 
@@ -466,5 +470,5 @@ def train(game: Type[Game],
                 tf.print(f'{int(i / checkpoint_interval)} savepoint in this session.')
                 estimator.save(checkpoint_path)
 
-        end_t = time.time()
-        tf.print(f'one iteration took: {end_t - start_t}')
+            end_t = time.time()
+            tf.print(f'one iteration took: {end_t - start_t}')

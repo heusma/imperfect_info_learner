@@ -189,7 +189,7 @@ class GridWorldContinuousNetwork(tf.keras.Model):
         for i in range(len(self.internal_layers)):
             l = self.internal_layers[i]
             ln = self.internal_layer_norms[i]
-            activation = l(ln(activation))
+            activation = ln(l(activation))
         return self.output_layer(activation)
 
 

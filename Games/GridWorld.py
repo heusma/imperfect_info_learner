@@ -7,6 +7,7 @@ from typing import Tuple, List
 import jsonpickle
 import tensorflow as tf
 import tensorflow_probability as tfp
+import tensorflow_addons as tfa
 
 import matplotlib.pyplot as plt
 
@@ -14,7 +15,7 @@ from Distributions.CategoricalDistribution import categorical_smoothing_function
 from EvaluationTool import Estimator, VTraceTarget, VTraceGradients
 from MDP import Game, State, InfoSet, Leaf, ActionSchema
 
-size = 20
+size = 10
 goal_x = 5
 goal_y = 5
 
@@ -125,7 +126,6 @@ class GridWorldNetwork(tf.keras.Model):
         super().__init__()
 
         self.internal_layers = []
-        self.internal_layer_norms = []
         for _ in range(num_layers):
             self.internal_layers.append(
                 tf.keras.layers.Dense(
@@ -133,9 +133,6 @@ class GridWorldNetwork(tf.keras.Model):
                     activation='relu',
                     kernel_initializer=tf.keras.initializers.VarianceScaling(
                         scale=2.0, mode='fan_in', distribution='truncated_normal'))
-            )
-            self.internal_layer_norms.append(
-                tf.keras.layers.LayerNormalization()
             )
         self.output_layer = tf.keras.layers.Dense(
             outputs,
@@ -149,18 +146,27 @@ class GridWorldNetwork(tf.keras.Model):
         activation = input
         for i in range(len(self.internal_layers)):
             l = self.internal_layers[i]
-            ln = self.internal_layer_norms[i]
-            activation = l(ln(activation))
+            activation = l(activation)
         return self.output_layer(activation)
 
 
 class GridWorldEstimator(Estimator):
     def __init__(self):
         self.weight_decay = 1e-4
-        self.internal_network_policy = GridWorldNetwork(num_layers=3, dff=40, outputs=4)
-        self.internal_network_value = GridWorldNetwork(num_layers=3, dff=40, outputs=1)
-        self.optimizer_policy = tf.keras.optimizers.SGD(learning_rate=0.005, momentum=0.9, nesterov=True)
-        self.optimizer_value = tf.keras.optimizers.SGD(learning_rate=0.005, momentum=0.9, nesterov=True)
+        self.internal_network_policy = GridWorldNetwork(num_layers=3, dff=80, outputs=4)
+        self.internal_network_value = GridWorldNetwork(num_layers=3, dff=80, outputs=1)
+        self.optimizer_policy = self.optimizer_policy = tfa.optimizers.SGDW(
+            weight_decay=self.weight_decay,
+            learning_rate=0.005,
+            momentum=0.9,
+            nesterov=True,
+        )
+        self.optimizer_value = self.optimizer_policy = tfa.optimizers.SGDW(
+            weight_decay=self.weight_decay,
+            learning_rate=0.005,
+            momentum=0.9,
+            nesterov=True,
+        )
 
     def info_set_to_vector(self, info_set: InfoSet):
         assert isinstance(info_set, GridWorldInfoSet)
@@ -204,12 +210,6 @@ class GridWorldEstimator(Estimator):
                 policy_losses.append(-tf.reduce_mean(tf.stack(local_policy_losses)))
 
             policy_loss = tf.reduce_mean(reach_weights * tf.stack(policy_losses))
-
-            for weights in self.internal_network_value.get_weights():
-                value_loss += self.weight_decay * tf.nn.l2_loss(weights)
-
-            for weights in self.internal_network_policy.get_weights():
-                policy_loss += self.weight_decay * tf.nn.l2_loss(weights)
 
         tv = self.internal_network_value.trainable_variables
         value_grads = tape.gradient(value_loss, tv)
