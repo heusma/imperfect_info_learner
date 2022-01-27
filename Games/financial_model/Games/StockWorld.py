@@ -32,10 +32,10 @@ max_horizon = 10
 max_budget_at_start = 10000
 
 allowed_discrete_actions_per_symbol = [
-    +1000, +9999999999999,
-    -1000, -9999999999999,
+    +2000, +9999999999999,
+    -2000, -9999999999999,
 ]
-days_skipped_after_wait_action = 2
+days_skipped_after_wait_action = 7
 days_skipped_after_transaction = 30
 
 archive = Archive('./Games/financial_model/Games/archive.json')
@@ -315,7 +315,7 @@ class StockWorld(Game):
 def stock_world_exploration_function(action_schema: ActionSchema) -> ActionSchema:
     assert isinstance(action_schema, StockWorldActionSchema)
 
-    smoothed_dist = categorical_smoothing_function(action_schema.dist, factor=0.2)
+    smoothed_dist = categorical_smoothing_function(action_schema.dist, factor=0.4)
 
     return StockWorldActionSchema(smoothed_dist)
 
@@ -384,11 +384,14 @@ class StockWorldEstimator(Estimator):
     def __init__(self):
         self.weight_decay = 1e-4
 
+        # Network config
         self.symbol_encoding_dim = 40
+        self.symbol_encoding_dim_scale = 4
         self.global_encoding_dim = 80
+        #
 
         self.internal_symbol_encoder = StockWorldNetwork(
-            num_layers=3, dff=self.symbol_encoding_dim * 4, outputs=self.symbol_encoding_dim
+            num_layers=3, dff=self.symbol_encoding_dim * self.symbol_encoding_dim_scale, outputs=self.symbol_encoding_dim
         )
         self.internal_global_state_encoder = StockWorldNetwork(
             num_layers=3, dff=self.symbol_encoding_dim * max_symbols_per_game, outputs=self.global_encoding_dim
@@ -454,7 +457,7 @@ class StockWorldEstimator(Estimator):
         c_dist = tfp.distributions.Categorical(logits)
         return StockWorldActionSchema(c_dist)
 
-    def get_trainable_variables(self):
+    def get_variables(self):
         tv = []
         tv += self.internal_symbol_encoder.trainable_variables
         tv += self.internal_global_state_encoder.trainable_variables
@@ -517,7 +520,7 @@ class StockWorldEstimator(Estimator):
 
             loss = value_loss + policy_loss
 
-        tv = self.get_trainable_variables()
+        tv = self.get_variables()
         grads = tape.gradient(loss, tv)
 
         return grads, []
@@ -525,7 +528,7 @@ class StockWorldEstimator(Estimator):
     def apply_gradients(self, grads: VTraceGradients):
         grads, _ = grads
 
-        tv = self.get_trainable_variables()
+        tv = self.get_variables()
         grads, _ = tf.clip_by_global_norm(grads, 5.0)
         self.optimizer.apply_gradients(zip(grads, tv))
 

@@ -28,6 +28,10 @@ class Estimator:
         pass
 
     @abstractmethod
+    def get_variables(self) -> List[tf.Variable]:
+        pass
+
+    @abstractmethod
     def save(self, checkpoint_location: str) -> None:
         pass
 
@@ -407,6 +411,24 @@ def filter_invalid_gradients(gradients: VTraceGradients) -> VTraceGradients:
     return gradients
 
 
+def assert_synced_model_variables(rank: int, size: int, estimator: Estimator):
+    if rank == 0:
+        model_vars = estimator.get_variables()
+        model_vars, _ = flatten_gradients(model_vars)
+        model_vars = model_vars.numpy()
+        for i in range(1, size):
+            buffer = np.empty(model_vars.size, dtype='f')
+            MPI.COMM_WORLD.Recv([buffer, MPI.FLOAT], source=i)
+            if not np.array_equal(model_vars, buffer):
+                raise AssertionError("The variables of one of the workers do not match.")
+        tf.print("Distributed estimators are synced.")
+    else:
+        model_vars = estimator.get_variables()
+        model_vars, _ = flatten_gradients(model_vars)
+        model_vars = model_vars.numpy()
+        MPI.COMM_WORLD.Send([model_vars, MPI.FLOAT], dest=0)
+
+
 def train(game: Type[Game],
           discount: float,
           max_steps: int,
@@ -462,10 +484,14 @@ def train(game: Type[Game],
         estimator.apply_gradients(gradients)
 
         i += 1
-        if rank == 0:
-            if i % test_interval == 0:
+        if i % test_interval == 0:
+            if rank == 0:
                 tf.print(f'{int(i / test_interval)} test in this session.')
                 game.test_performance(estimator)
+
+            assert_synced_model_variables(rank, size, estimator)
+
+        if rank == 0:
             if i % checkpoint_interval == 0:
                 tf.print(f'{int(i / checkpoint_interval)} savepoint in this session.')
                 estimator.save(checkpoint_path)

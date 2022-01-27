@@ -15,9 +15,9 @@ from Distributions.CategoricalDistribution import categorical_smoothing_function
 from EvaluationTool import Estimator, VTraceTarget, VTraceGradients
 from MDP import Game, State, InfoSet, Leaf, ActionSchema
 
-size = 10
-goal_x = 5
-goal_y = 5
+size = 5
+goal_x = 2
+goal_y = 2
 
 
 class GridWorldState(State):
@@ -126,6 +126,7 @@ class GridWorldNetwork(tf.keras.Model):
         super().__init__()
 
         self.internal_layers = []
+        self.internal_layer_norms = []
         for _ in range(num_layers):
             self.internal_layers.append(
                 tf.keras.layers.Dense(
@@ -133,6 +134,9 @@ class GridWorldNetwork(tf.keras.Model):
                     activation='relu',
                     kernel_initializer=tf.keras.initializers.VarianceScaling(
                         scale=2.0, mode='fan_in', distribution='truncated_normal'))
+            )
+            self.internal_layer_norms.append(
+                tf.keras.layers.LayerNormalization()
             )
         self.output_layer = tf.keras.layers.Dense(
             outputs,
@@ -146,27 +150,36 @@ class GridWorldNetwork(tf.keras.Model):
         activation = input
         for i in range(len(self.internal_layers)):
             l = self.internal_layers[i]
-            activation = l(activation)
+            ln = self.internal_layer_norms[i]
+            activation = ln(l(activation))
         return self.output_layer(activation)
 
 
 class GridWorldEstimator(Estimator):
     def __init__(self):
         self.weight_decay = 1e-4
-        self.internal_network_policy = GridWorldNetwork(num_layers=3, dff=80, outputs=4)
-        self.internal_network_value = GridWorldNetwork(num_layers=3, dff=80, outputs=1)
-        self.optimizer_policy = self.optimizer_policy = tfa.optimizers.SGDW(
+        self.internal_network_policy = GridWorldNetwork(num_layers=3, dff=100, outputs=4)
+        self.internal_network_value = GridWorldNetwork(num_layers=3, dff=100, outputs=1)
+        self.optimizer_policy = tfa.optimizers.SGDW(
             weight_decay=self.weight_decay,
             learning_rate=0.005,
             momentum=0.9,
             nesterov=True,
         )
-        self.optimizer_value = self.optimizer_policy = tfa.optimizers.SGDW(
+        self.optimizer_value = tfa.optimizers.SGDW(
             weight_decay=self.weight_decay,
             learning_rate=0.005,
             momentum=0.9,
             nesterov=True,
         )
+
+        self.version = 0
+
+    def get_variables(self) -> List[tf.Variable]:
+        result = []
+        result += self.internal_network_value.trainable_variables
+        result += self.internal_network_policy.trainable_variables
+        return result
 
     def info_set_to_vector(self, info_set: InfoSet):
         assert isinstance(info_set, GridWorldInfoSet)
@@ -231,7 +244,45 @@ class GridWorldEstimator(Estimator):
         self.optimizer_policy.apply_gradients(zip(policy_grads, tp))
 
     def save(self, checkpoint_location: str) -> None:
-        pass
+        value_net_location = os.path.dirname(checkpoint_location) + "/data/value"
+        policy_net_location = os.path.dirname(checkpoint_location) + "/data/policy"
+        checkpoint_object = jsonpickle.encode({
+            "version": random.randint(1, 10000000),
+            "value_net_location": value_net_location,
+            "policy_net_location": policy_net_location
+        })
+        success = False
+        while success is False:
+            try:
+                os.makedirs(os.path.dirname(value_net_location), exist_ok=True)
+                self.internal_network_value.save_weights(value_net_location)
+                self.internal_network_policy.save_weights(policy_net_location)
+                with open(checkpoint_location, 'w') as f:
+                    f.write(checkpoint_object)
+                success = True
+                tf.print("saved")
+            except:
+                tf.print("save error")
+                sleep(1)
 
     def load(self, checkpoint_location: str, blocking: bool = True) -> None:
-        pass
+        self.internal_network_value(tf.zeros(shape=(1, 2)))
+        self.internal_network_policy(tf.zeros(shape=(1, 2)))
+        success = False
+        while success is False:
+            try:
+                with open(checkpoint_location, 'r') as f:
+                    json_object = f.read()
+                    checkpoint = jsonpickle.decode(json_object)
+                    version = checkpoint["version"]
+                    if self.version != version:
+                        tf.print("loaded new version")
+                        self.internal_network_value.load_weights(checkpoint["value_net_location"])
+                        self.internal_network_policy.load_weights(checkpoint["policy_net_location"])
+                        self.version = version
+                    success = True
+            except:
+                tf.print("load error")
+                sleep(10)
+                if blocking is False:
+                    success = True

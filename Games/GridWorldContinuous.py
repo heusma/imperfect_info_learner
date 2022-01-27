@@ -128,7 +128,7 @@ class GridWorldContinuous(Game):
     @staticmethod
     def test_performance(estimator: any):
         GridWorldContinuous.test_policy(estimator)
-        #GridWorldContinuous.show_tile_values(estimator)
+        GridWorldContinuous.show_tile_values(estimator)
         info_set = GridWorldContinuousInfoSet(GridWorldState(0, 0))
         values, action_schemas = zip(*estimator.evaluate([info_set]))
         tf.print("0, 0 estimate:")
@@ -213,6 +213,12 @@ class GridWorldContinuousEstimator(Estimator):
         )
 
         self.version = 0
+
+    def get_variables(self) -> List[tf.Variable]:
+        result = []
+        result += self.internal_network_value.trainable_variables
+        result += self.internal_network_policy.trainable_variables
+        return result
 
     def info_set_to_vector(self, info_set: InfoSet):
         assert isinstance(info_set, GridWorldContinuousInfoSet)
