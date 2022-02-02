@@ -6,12 +6,11 @@ from typing import Tuple, List
 
 import jsonpickle
 import tensorflow as tf
-import tensorflow_probability as tfp
 import tensorflow_addons as tfa
 
 import matplotlib.pyplot as plt
 
-from Distributions.CategoricalDistribution import categorical_smoothing_function
+from Distributions.CategoricalDistribution import categorical_smoothing_function, Categorical
 from EvaluationTool import Estimator, VTraceTarget, VTraceGradients
 from MDP import Game, State, InfoSet, Leaf, ActionSchema
 
@@ -27,7 +26,7 @@ class GridWorldState(State):
 
 
 class GridWorldActionSchema(ActionSchema):
-    def __init__(self, categorical_distribution: tfp.distributions.Categorical):
+    def __init__(self, categorical_distribution: Categorical):
         self.dist = categorical_distribution
 
     def sample(self) -> Tuple[float, tf.Tensor]:
@@ -52,7 +51,7 @@ class GridWorldInfoSet(InfoSet):
         self.position_y = state.position_y
 
     def get_action_schema(self) -> ActionSchema:
-        return GridWorldActionSchema(tfp.distributions.Categorical(logits=tf.zeros(shape=(4,))))
+        return GridWorldActionSchema(Categorical(logits=tf.zeros(shape=(4,))))
 
 
 class GridWorld(Game):
@@ -116,7 +115,7 @@ class GridWorld(Game):
 def grid_world_exploration_function(action_schema: ActionSchema) -> ActionSchema:
     assert isinstance(action_schema, GridWorldActionSchema)
 
-    smoothed_dist = categorical_smoothing_function(action_schema.dist, factor=0.4)
+    smoothed_dist = categorical_smoothing_function(action_schema.dist, factor=0.2)
 
     return GridWorldActionSchema(smoothed_dist)
 
@@ -126,18 +125,24 @@ class GridWorldNetwork(tf.keras.Model):
         super().__init__()
 
         self.internal_layers = []
-        self.internal_layer_norms = []
+        self.internal_layer_norms = [tf.keras.layers.LayerNormalization()]
         for _ in range(num_layers):
             self.internal_layers.append(
                 tf.keras.layers.Dense(
                     dff,
-                    activation='relu',
+                    activation=tf.keras.layers.LeakyReLU(),
                     kernel_initializer=tf.keras.initializers.VarianceScaling(
                         scale=2.0, mode='fan_in', distribution='truncated_normal'))
             )
             self.internal_layer_norms.append(
                 tf.keras.layers.LayerNormalization()
             )
+        self.input_layer = tf.keras.layers.Dense(
+            dff,
+            activation=None,
+            kernel_initializer=tf.keras.initializers.RandomUniform(minval=-0.03, maxval=0.03),
+            bias_initializer=tf.keras.initializers.Constant(-0.2)
+        )
         self.output_layer = tf.keras.layers.Dense(
             outputs,
             activation=None,
@@ -147,19 +152,21 @@ class GridWorldNetwork(tf.keras.Model):
 
     @tf.function(experimental_relax_shapes=True)
     def __call__(self, input, *args, **kwargs):
-        activation = input
+        activation = self.internal_layers[-1](self.input_layer(input))
         for i in range(len(self.internal_layers)):
+            l_in = activation
             l = self.internal_layers[i]
             ln = self.internal_layer_norms[i]
             activation = ln(l(activation))
+            activation = (activation + l_in) / 2
         return self.output_layer(activation)
 
 
 class GridWorldEstimator(Estimator):
     def __init__(self):
         self.weight_decay = 1e-4
-        self.internal_network_policy = GridWorldNetwork(num_layers=3, dff=100, outputs=4)
-        self.internal_network_value = GridWorldNetwork(num_layers=3, dff=100, outputs=1)
+        self.internal_network_policy = GridWorldNetwork(num_layers=5, dff=100, outputs=4)
+        self.internal_network_value = GridWorldNetwork(num_layers=5, dff=100, outputs=1)
         self.optimizer_policy = tfa.optimizers.SGDW(
             weight_decay=self.weight_decay,
             learning_rate=0.005,
@@ -186,7 +193,7 @@ class GridWorldEstimator(Estimator):
         return tf.cast([info_set.position_x / size, info_set.position_y / size], dtype=tf.float32)
 
     def vector_to_action_schema(self, logits):
-        c_dist = tfp.distributions.Categorical(logits)
+        c_dist = Categorical(logits)
         return GridWorldActionSchema(c_dist)
 
     def evaluate(self, info_sets: List[InfoSet]) -> List[Tuple[tf.Tensor, ActionSchema]]:

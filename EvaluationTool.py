@@ -223,23 +223,19 @@ def analyse(game: Type[Game], trajectory: Trajectory,
         unrolls = gather_unrolls(game, trajectory_element, num_samples, batch_size, estimator, exploration_function,
                                  max_steps)
 
-        if len(trajectory) - i >= max_steps:
-            unroll_from_outer_trajectory = []
-            for u in range(max_steps):
-                unroll_from_outer_trajectory.append(
-                    trajectory[i + u]
-                )
-            if len(trajectory) > i + max_steps and isinstance(trajectory[i + max_steps], Leaf):
-                unroll_from_outer_trajectory.append(Leaf())
-            unrolls.append(unroll_from_outer_trajectory)
+        # add the outer trajectory as an unroll
+        outer_unroll = trajectory[i:i+max_steps]
+        if len(outer_unroll) > 0:
+            unrolls.append(trajectory[i:i+max_steps])
 
         v_trace_targets = [
             list(trajectory_to_vtrace_targets(unroll, discount, p, c))[0] for unroll in unrolls
         ]
 
+        num_targets = len(v_trace_targets)
         mean_value_target = tf.zeros(shape=())
         q_value_targets = []
-        for j in range(num_samples):
+        for j in range(num_targets):
             value_target, q_value_target = v_trace_targets[j]
             mean_value_target += value_target
             _, _, _, _, _, on_policy_probability, off_policy_probability, action, _ = unrolls[j][0]
@@ -252,7 +248,7 @@ def analyse(game: Type[Game], trajectory: Trajectory,
                         q_value_target[info_set.current_player],
                     )
                 )
-        mean_value_target /= num_samples
+        mean_value_target /= num_targets
 
         if valid_v_trace_target(reach_importance_weight, mean_value_target, q_value_targets):
             trajectory_v_trace_targets.append(
@@ -411,10 +407,21 @@ def filter_invalid_gradients(gradients: VTraceGradients) -> VTraceGradients:
     return gradients
 
 
+def fix_nan_variables(estimator: Estimator, model_vars, shapes):
+    if tf.reduce_any(tf.math.is_nan(model_vars)):
+        tf.print("The variables of one of the workers contain nan values.")
+        model_vars = tf.clip_by_value(model_vars, -1, 1)
+        model_vars_reshaped, _ = reshape_gradient_values(model_vars, shapes)
+        for source, target in zip(model_vars_reshaped, estimator.get_variables()):
+            target.assign(source)
+    return model_vars
+
+
 def assert_synced_model_variables(rank: int, size: int, estimator: Estimator):
     if rank == 0:
         model_vars = estimator.get_variables()
-        model_vars, _ = flatten_gradients(model_vars)
+        model_vars, shapes = flatten_gradients((model_vars, []))
+        model_vars = fix_nan_variables(estimator, model_vars, shapes)
         model_vars = model_vars.numpy()
         for i in range(1, size):
             buffer = np.empty(model_vars.size, dtype='f')
@@ -424,7 +431,8 @@ def assert_synced_model_variables(rank: int, size: int, estimator: Estimator):
         tf.print("Distributed estimators are synced.")
     else:
         model_vars = estimator.get_variables()
-        model_vars, _ = flatten_gradients(model_vars)
+        model_vars, shapes = flatten_gradients((model_vars, []))
+        model_vars = fix_nan_variables(estimator, model_vars, shapes)
         model_vars = model_vars.numpy()
         MPI.COMM_WORLD.Send([model_vars, MPI.FLOAT], dest=0)
 
@@ -435,7 +443,7 @@ def train(game: Type[Game],
           horizon: int,
           num_trajectory_samples: int,
           max_targets_per_trajectory: int,
-          num_unroll_samples_per_visited_state: int,
+          num_additional_unroll_samples_per_visited_state: int,
           estimator: Estimator,
           batch_size: int,
           exploration_function: Callable,
@@ -460,7 +468,7 @@ def train(game: Type[Game],
                                            max_steps=max_steps)
 
             targets = analyse(game, trajectory, max_targets_per_trajectory,
-                              num_samples=num_unroll_samples_per_visited_state, batch_size=batch_size,
+                              num_samples=num_additional_unroll_samples_per_visited_state, batch_size=batch_size,
                               estimator=estimator, exploration_function=exploration_function, max_steps=horizon,
                               discount=discount, p=p, c=c, r=r)
 

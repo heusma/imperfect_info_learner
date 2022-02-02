@@ -26,7 +26,6 @@ class BoxDistribution:
             force_probs_to_zero_outside_support=False,
         )
 
-
     def sample(self) -> tf.Tensor:
         s = self.distribution.sample()
         # now map this sample between min and max

@@ -1,6 +1,8 @@
 import json
 import time
 
+import tensorflow as tf
+
 import jsonpickle
 
 
@@ -17,9 +19,9 @@ class Archive:
             data = json.load(f)
             self.dict = jsonpickle.decode(data)
         except IOError:
-            print("Archive file error.")
+            tf.print("Archive file error.")
         end = time.time()
-        print(f'archive load took: {end - start}')
+        tf.print(f'archive load took: {end - start}')
 
     def save(self):
         start = time.time()
@@ -27,7 +29,7 @@ class Archive:
         with open(self.path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
         end = time.time()
-        print(f'archive save took: {end - start}')
+        tf.print(f'archive save took: {end - start}')
 
     def __getitem__(self, path):
         node = self.dict

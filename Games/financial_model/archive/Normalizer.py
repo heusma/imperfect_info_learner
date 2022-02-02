@@ -5,6 +5,7 @@ from typing import List, Tuple
 import jsonpickle
 
 import numpy as np
+import tensorflow as tf
 
 from Games.financial_model.archive.Archive import Archive
 from Games.financial_model.archive.structures.Timeline import TimelinePointer, Timeline
@@ -78,9 +79,9 @@ class Normalizer:
             data = json.load(f)
             self.dict = jsonpickle.decode(data)
         except IOError:
-            print("Normalizer file error.")
+            tf.print("Normalizer file error.")
         end = time.time()
-        print(f'archive load took: {end - start}')
+        tf.print(f'Normalizer load took: {end - start}')
 
     def save(self):
         start = time.time()
@@ -88,4 +89,4 @@ class Normalizer:
         with open(self.path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
         end = time.time()
-        print(f'Normalizer save took: {end - start}')
+        tf.print(f'Normalizer save took: {end - start}')

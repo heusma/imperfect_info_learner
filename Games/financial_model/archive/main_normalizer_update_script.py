@@ -1,8 +1,8 @@
 from Games.financial_model.archive.Archive import Archive
 from Games.financial_model.archive.Normalizer import Normalizer
 
-archive = Archive('../Games/archive.json')
-normalizer = Normalizer('../Games/norm.json')
+archive = Archive('../../../StockWorldData/archive.json')
+normalizer = Normalizer('../../../StockWorldData/norm.json')
 
 normalizer.build(archive)
 

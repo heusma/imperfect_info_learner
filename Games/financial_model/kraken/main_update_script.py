@@ -4,14 +4,14 @@ import requests
 
 from Games.financial_model.archive.Archive import Archive
 from Games.financial_model.kraken.FinModPrep.stocks.datatypes.entities import Price, MarketCapitalization, Dividend, \
-    FinancialStatement
+    FinancialStatement, EconomicIndicators
 
 """Config"""
 max_symbols = 10
 allowed_exchanges = ["NASDAQ"]
 """-"""
 
-archive = Archive('../Games/archive.json')
+archive = Archive('../../../StockWorldData/archive.json')
 
 symbols = requests.get(
     'https://financialmodelingprep.com/api/v3/stock/list?apikey=ae94d52fd1ea5b77c7614381ced3d130'
@@ -58,5 +58,12 @@ for symbol in symbols:
 
     if len(archive.dict) >= max_symbols:
         break
+
+# gather global_pointers
+path = ['GLOBAL']
+economic_indicator_timelines = EconomicIndicators.request()
+for key in economic_indicator_timelines:
+    archive[path + [key]] = economic_indicator_timelines[key]
+
 
 archive.save()

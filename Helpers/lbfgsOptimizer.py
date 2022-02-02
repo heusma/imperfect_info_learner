@@ -1,6 +1,5 @@
 import tensorflow as tf
 import numpy as np
-import tensorflow_probability as tfp
 
 """
 Hier das grundsaätzliche vorgehen für einen einzigen schritt:
@@ -83,33 +82,3 @@ def function_factory(model, loss, train_x, train_y):
     f.shapes = shapes
 
     return f
-
-def get_lbfg_gradient(model, loss_fun, train_x, train_y, param_cover_factor):
-    func = function_factory(model, loss_fun, train_x, train_y)
-
-    # convert initial model parameters to a 1D tf.Tensor
-    init_params = tf.dynamic_stitch(func.idx, model.trainable_variables)
-
-    # train the model with L-BFGS solver
-    results = tfp.optimizer.lbfgs_minimize(
-        value_and_gradients_function=func,
-        initial_position=init_params,
-        max_iterations=int(init_params.shape[0] * param_cover_factor),
-        max_line_search_iterations=int(init_params.shape[0] * param_cover_factor)
-    )
-
-    # after training, the final optimized parameters are still in results.position
-    # so we have to manually put them back to the model
-    gradient_estimate = init_params - results.position
-
-    params = tf.dynamic_partition(gradient_estimate, func.part, func.n_tensors)
-    grads = []
-    for i, (shape, param) in enumerate(zip(func.shapes, params)):
-        grads.append(tf.reshape(param, shape))
-
-    grads, _ = tf.clip_by_global_norm(
-        grads,
-        tf.linalg.global_norm(model.trainable_variables)
-    )
-
-    return grads

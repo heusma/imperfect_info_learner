@@ -169,7 +169,7 @@ class GridWorldContinuousNetwork(tf.keras.Model):
             self.internal_layers.append(
                 tf.keras.layers.Dense(
                     dff,
-                    activation='relu',
+                    activation=tf.keras.layers.LeakyReLU(),
                     kernel_initializer=tf.keras.initializers.VarianceScaling(
                         scale=2.0, mode='fan_in', distribution='truncated_normal'))
             )
