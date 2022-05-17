@@ -48,7 +48,48 @@ def get_natural_gradient(model, loss_fun, train_x, train_y):
 
     eps = 1e-3
     eye_eps = tf.eye(h_mat.shape[0]) * eps
-    update = tf.linalg.solve(h_mat + eye_eps, g_vec)
+    update = tf.linalg.solve((h_mat + eye_eps), g_vec)
+
+    return reshape_flattend(tf.squeeze(update), shapes, part, n_tensors)
+
+
+def get_natural_gradient_scale(model, loss_fun, train_x, train_y):
+    # obtain the shapes of all trainable parameters in the model
+    shapes = tf.shape_n(model.trainable_variables)
+    n_tensors = len(shapes)
+
+    # we'll use tf.dynamic_stitch and tf.dynamic_partition later, so we need to
+    # prepare required information first
+    count = 0
+    idx = []  # stitch indices
+    part = []  # partition indices
+
+    for i, shape in enumerate(shapes):
+        n = np.product(shape)
+        idx.append(tf.reshape(tf.range(count, count + n, dtype=tf.int32), shape))
+        part.extend([i] * n)
+        count += n
+
+    part = tf.constant(part)
+
+    with tf.GradientTape() as outer_tape:
+        with tf.GradientTape() as inner_tape:
+            loss = loss_fun(model, train_x, train_y)
+
+        inner_tape_grads = inner_tape.gradient(loss, model.trainable_variables)
+        g_vec = tf.expand_dims(tf.dynamic_stitch(idx, inner_tape_grads), axis=-1)
+
+    h = outer_tape.jacobian(g_vec, model.trainable_variables)
+
+    for i in range(len(h)):
+        h[i] = tf.reshape(h[i], shape=(h[i].shape[0], -1))
+    h_mat = tf.concat(h, axis=-1)
+
+    eps = 1e-3
+    eye_eps = tf.eye(h_mat.shape[0]) * eps
+    scale = tf.linalg.inv(tf.math.abs(h_mat + eye_eps))
+    update = tf.matmul(scale, g_vec)
+    # H*a*g = g <=> g*a = H^-1 * g <=>
 
     return reshape_flattend(tf.squeeze(update), shapes, part, n_tensors)
 
@@ -116,7 +157,7 @@ def get_natural_gradient_hessian_free_back_over_back(model, loss_fun, train_x, t
     inital_r_norm = tf.norm(
         r, ord='euclidean'
     )
-    #tf.print(inital_r_norm)
+    # tf.print(inital_r_norm)
 
     optimium = [
         inital_r_norm,
@@ -131,7 +172,7 @@ def get_natural_gradient_hessian_free_back_over_back(model, loss_fun, train_x, t
 
         r, d, vector, r_k_dot, r_norm = inner_evaluation(z, r, d, r_k_dot, vector)
 
-        #tf.print(r_norm)
+        # tf.print(r_norm)
         if r_norm < optimium[0]:
             optimium[0] = r_norm
             optimium[1] = vector
@@ -141,7 +182,10 @@ def get_natural_gradient_hessian_free_back_over_back(model, loss_fun, train_x, t
     tf.print(f'back over back optimium was {optimium[0]}')
 
     natural_gradient = -optimium[1]
-    return reshape_flattend(natural_gradient, shapes, part, n_tensors)
+
+    update = natural_gradient
+
+    return reshape_flattend(update, shapes, part, n_tensors)
 
 
 def get_natural_gradient_hessian_free_forward_over_back(model, loss_fun, train_x, train_y, max_iterations):
@@ -263,7 +307,7 @@ def get_natural_gradient_hessian_free_jacobian_preconditioned(model, loss_fun, t
     inital_r_norm = tf.norm(
         r, ord='euclidean'
     )
-    #tf.print(inital_r_norm)
+    # tf.print(inital_r_norm)
 
     optimium = [
         inital_r_norm,
@@ -342,7 +386,8 @@ def get_natural_gradient_hessian_free_jacobian_preconditioned_v2(model, loss_fun
         model, loss_fun, train_x, train_y, reshape_flattend(Jvp, shapes, part, n_tensors)
     )
     JHvpP = tf.squeeze(
-        tf.matmul(tf.transpose(tf.expand_dims(jacobian, axis=-1)), tf.expand_dims(tf.dynamic_stitch(idx, hJvpp), axis=-1))
+        tf.matmul(tf.transpose(tf.expand_dims(jacobian, axis=-1)),
+                  tf.expand_dims(tf.dynamic_stitch(idx, hJvpp), axis=-1))
     )
     r = b - JHvpP
     d = r

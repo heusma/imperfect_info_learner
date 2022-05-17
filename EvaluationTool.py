@@ -459,6 +459,7 @@ def train(game: Type[Game],
     i = 0
     while True:
         start_t = time.time()
+        targets = []
         gradients = []
         for _ in range(num_trajectory_samples):
             root_s, root_i = game.get_root()
@@ -467,19 +468,21 @@ def train(game: Type[Game],
                                            exploration_function=exploration_function,
                                            max_steps=max_steps)
 
-            targets = analyse(game, trajectory, max_targets_per_trajectory,
+            local_targets = analyse(game, trajectory, max_targets_per_trajectory,
                               num_samples=num_additional_unroll_samples_per_visited_state, batch_size=batch_size,
                               estimator=estimator, exploration_function=exploration_function, max_steps=horizon,
                               discount=discount, p=p, c=c, r=r)
 
-            if len(targets) == 0:
-                continue
+            targets += local_targets
 
-            local_gradients = get_gradient_from_targets(targets, batch_size=batch_size, estimator=estimator)
+        if len(targets) == 0:
+            continue
 
-            local_gradients = filter_invalid_gradients(local_gradients)
+        local_gradients = get_gradient_from_targets(targets, batch_size=batch_size, estimator=estimator)
 
-            gradients.append(local_gradients)
+        local_gradients = filter_invalid_gradients(local_gradients)
+
+        gradients.append(local_gradients)
 
         if len(gradients) == 0:
             tf.print("loop again caused by missing gradients.")

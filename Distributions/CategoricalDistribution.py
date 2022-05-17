@@ -26,6 +26,6 @@ def categorical_smoothing_function(dist: Categorical, factor: float) -> Categori
 
     new_probs = probs * (1 - factor)
     new_probs += (factor / probs.shape[0])
-    new_probs /= tf.reduce_sum(probs)
+    new_probs /= tf.reduce_sum(new_probs)
 
     return Categorical(tf.math.log(new_probs))

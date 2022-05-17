@@ -1,14 +1,16 @@
+# mpiexec -n 3 python main.py
+
 import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 from mpi4py import MPI
 
 from EvaluationTool import train, identity_exploration_function
 
-from Games.GridWorld import GridWorld, grid_world_exploration_function, GridWorldEstimator
+#from Games.GridWorld import GridWorld, grid_world_exploration_function, GridWorldEstimator
 
-#from Games.financial_model.Games.StockWorld import StockWorld, StockWorldEstimator, stock_world_exploration_function
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+from Games.financial_model.Games.StockWorld import StockWorld, StockWorldEstimator, stock_world_exploration_function
 
 work_dir = "."
 # work_dir = os.environ["WORK"]
@@ -18,25 +20,25 @@ size = comm.Get_size()
 rank = comm.Get_rank()
 
 ## config
-game = GridWorld
+game = StockWorld
 discount = 0.97
-max_steps = 30
-horizon = 4
-num_trajectory_samples = 1
-max_targets_per_trajectory = 20
-num_additional_unroll_samples_per_visited_state = 1
+horizon = 12
+num_trajectory_samples = 4
+max_targets_per_trajectory = 5
+max_steps = max(3 * 12, max_targets_per_trajectory + horizon)
+num_additional_unroll_samples_per_visited_state = 3
 
-estimator = GridWorldEstimator()
+estimator = StockWorldEstimator()
 batch_size = 40
 
-exploration_function = grid_world_exploration_function
+exploration_function = stock_world_exploration_function
 p = 10
 c = 1
 r = c
 
-test_interval = 100
+test_interval = 20
 checkpoint_interval = 500
-checkpoint_path = work_dir + "/checkpoints_grid/checkpoint.json"
+checkpoint_path = work_dir + "/checkpoints_stock/checkpoint.json"
 ##
 
 # sync estimators before training
