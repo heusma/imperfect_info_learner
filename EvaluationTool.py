@@ -6,6 +6,7 @@ from typing import Tuple, Callable, List, Type
 import numpy as np
 import tensorflow as tf
 from mpi4py import MPI
+from mpi4py.futures.pool import ThreadPoolExecutor, MPIPoolExecutor
 
 from MDP import State, InfoSet, Leaf, Game, ActionSchema
 
@@ -14,7 +15,21 @@ VTraceTarget = Tuple[InfoSet, float, tf.Tensor, List[QValueTarget]]
 VTraceGradients = Tuple[List[tf.Tensor], List[tf.Tensor]]
 
 
+class CompiledModel(tf.keras.Model):
+    def __init__(self, optimizer: tf.keras.optimizers.Optimizer):
+        super().__init__()
+        self.optimizer = optimizer
+
+    @abstractmethod
+    def __call__(self, *args, **kwargs):
+        pass
+
+
 class Estimator:
+    def __init__(self, value_network: CompiledModel, policy_network: CompiledModel):
+        self.value_network = value_network
+        self.policy_network = policy_network
+
     @abstractmethod
     def evaluate(self, info_sets: List[InfoSet]) -> List[Tuple[tf.Tensor, ActionSchema]]:
         pass
@@ -163,7 +178,7 @@ def trajectory_to_vtrace_targets(trajectory: Trajectory, discount: float, p: flo
     for i in reversed(range(len(trajectory) - 1)):
         _, _, value_estimate_cn, _, _, on_policy_probability, off_policy_probability, _, direct_reward = trajectory[i]
 
-        importance_weight = on_policy_probability / off_policy_probability
+        importance_weight = tf.math.divide_no_nan(on_policy_probability, off_policy_probability)
         p_t = tf.minimum(p, importance_weight)
         c_t = tf.minimum(c, importance_weight)
 
@@ -190,7 +205,8 @@ def valid_v_trace_target(reach_importance_weight, mean_value_target, q_value_tar
     if len(q_value_targets) == 0:
         return False
     tmp = tf.concat([reach_importance_weight, tf.squeeze(mean_value_target)], axis=0)
-    return not (tf.reduce_any(tf.math.is_nan(tmp)) or tf.reduce_any(tf.math.is_inf(tmp)))
+    b_contains_invalid_values = (tf.reduce_any(tf.math.is_nan(tmp)) or tf.reduce_any(tf.math.is_inf(tmp)))
+    return not b_contains_invalid_values
 
 
 def analyse(game: Type[Game], trajectory: Trajectory,
@@ -204,29 +220,38 @@ def analyse(game: Type[Game], trajectory: Trajectory,
             r: float,
             p: float,
             c: float) -> List[VTraceTarget]:
-    on_policy_reach = 1.0
-    off_policy_reach = 1.0
-    trajectory_v_trace_targets = []
-
     chosen_elements = range(len(trajectory) - 1)
     if len(chosen_elements) > max_targets_per_trajectory:
         chosen_elements = random.sample(chosen_elements, max_targets_per_trajectory)
-    for i in chosen_elements:
 
-        trajectory_element = trajectory[i]
+    trajectory_v_trace_targets = []
+    for trajectory_index in chosen_elements:
+        on_policy_reach = 1.0
+        off_policy_reach = 1.0
+
+        for z in range(trajectory_index):
+            trajectory_element = trajectory[z]
+            _, _, _, _, _, on_policy_probability, off_policy_probability, _, _ = trajectory_element
+
+            if on_policy_reach * on_policy_probability == 0 or off_policy_reach * off_policy_probability == 0:
+                trajectory_index = z
+                break
+            else:
+                on_policy_reach *= on_policy_probability
+                off_policy_reach *= off_policy_probability
+
+        reach_importance_weight = tf.minimum(r, tf.math.divide_no_nan(on_policy_reach, off_policy_reach))
+
+        trajectory_element = trajectory[trajectory_index]
         _, info_set, _, _, _, on_policy_probability, off_policy_probability, _, _ = trajectory_element
-
-        on_policy_reach *= on_policy_probability
-        off_policy_reach *= off_policy_probability
-        reach_importance_weight = tf.minimum(r, on_policy_reach / off_policy_reach)
 
         unrolls = gather_unrolls(game, trajectory_element, num_samples, batch_size, estimator, exploration_function,
                                  max_steps)
 
         # add the outer trajectory as an unroll
-        outer_unroll = trajectory[i:i+max_steps]
+        outer_unroll = trajectory[trajectory_index:trajectory_index + max_steps]
         if len(outer_unroll) > 0:
-            unrolls.append(trajectory[i:i+max_steps])
+            unrolls.append(trajectory[trajectory_index:trajectory_index + max_steps])
 
         v_trace_targets = [
             list(trajectory_to_vtrace_targets(unroll, discount, p, c))[0] for unroll in unrolls
@@ -277,13 +302,59 @@ def compute_gradient_mean(grads: List[VTraceGradients]) -> VTraceGradients:
     return v_grads, p_grads
 
 
+def compute_gradients(estimator: Estimator, target_batch: List[VTraceTarget]):
+    with tf.GradientTape(persistent=True) as tape:
+        info_sets, reach_weights, value_targets, q_value_targets = zip(*target_batch)
+        value_estimates, on_policy_action_schemas = zip(*estimator.evaluate(info_sets))
+
+        value_losses = reach_weights * tf.keras.losses.huber(
+            y_pred=tf.stack(value_estimates), y_true=tf.stack(value_targets)
+        )
+        value_loss = tf.reduce_mean(value_losses)
+
+        policy_losses = []
+        for i in range(len(target_batch)):
+            local_policy_losses = []
+            action_schema = on_policy_action_schemas[i]
+            assert isinstance(action_schema, ActionSchema)
+            value_estimate = value_estimates[i]
+            for action, importance, q_value in q_value_targets[i]:
+                advantage = q_value - value_estimate
+                on_policy_log_prob = action_schema.log_prob(action)
+                policy_loss = importance * on_policy_log_prob * advantage
+                local_policy_losses.append(policy_loss)
+            policy_losses.append(-tf.reduce_mean(tf.stack(local_policy_losses)))
+
+        policy_loss = tf.reduce_mean(reach_weights * tf.stack(policy_losses))
+
+    tv = estimator.value_network.trainable_variables
+    value_grads = tape.gradient(value_loss, tv)
+
+    tp = estimator.policy_network.trainable_variables
+    policy_grads = tape.gradient(policy_loss, tp)
+
+    return value_grads, policy_grads
+
+
+def apply_gradients(estimator: Estimator, grads: VTraceGradients):
+    value_grads, policy_grads = grads
+
+    tv = estimator.value_network.trainable_variables
+    value_grads, _ = tf.clip_by_global_norm(value_grads, 5.0)
+    estimator.value_network.optimizer.apply_gradients(zip(value_grads, tv))
+
+    tp = estimator.policy_network.trainable_variables
+    policy_grads, _ = tf.clip_by_global_norm(policy_grads, 5.0)
+    estimator.value_network.optimizer.apply_gradients(zip(policy_grads, tp))
+
+
 def get_gradient_from_targets(targets: List[VTraceTarget], batch_size: int, estimator: Estimator) -> VTraceGradients:
     worklist_pointer = 0
     gradients = []
     while worklist_pointer < len(targets):
         batch = targets[worklist_pointer:worklist_pointer + batch_size]
         worklist_pointer += batch_size
-        local_grads = estimator.compute_gradients(batch)
+        local_grads = compute_gradients(estimator, batch)
         gradients.append(local_grads)
 
     return compute_gradient_mean(gradients)
@@ -469,13 +540,14 @@ def train(game: Type[Game],
                                            max_steps=max_steps)
 
             local_targets = analyse(game, trajectory, max_targets_per_trajectory,
-                              num_samples=num_additional_unroll_samples_per_visited_state, batch_size=batch_size,
-                              estimator=estimator, exploration_function=exploration_function, max_steps=horizon,
-                              discount=discount, p=p, c=c, r=r)
+                                    num_samples=num_additional_unroll_samples_per_visited_state, batch_size=batch_size,
+                                    estimator=estimator, exploration_function=exploration_function, max_steps=horizon,
+                                    discount=discount, p=p, c=c, r=r)
 
             targets += local_targets
 
         if len(targets) == 0:
+            tf.print("No Targets. Repeat.")
             continue
 
         local_gradients = get_gradient_from_targets(targets, batch_size=batch_size, estimator=estimator)
@@ -492,7 +564,7 @@ def train(game: Type[Game],
 
         gradients = sync_gradients(rank, size, gradients)
 
-        estimator.apply_gradients(gradients)
+        apply_gradients(estimator, gradients)
 
         i += 1
         if i % test_interval == 0:

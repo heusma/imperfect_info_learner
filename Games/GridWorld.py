@@ -11,7 +11,7 @@ import tensorflow_addons as tfa
 import matplotlib.pyplot as plt
 
 from Distributions.CategoricalDistribution import categorical_smoothing_function, Categorical
-from EvaluationTool import Estimator, VTraceTarget, VTraceGradients
+from EvaluationTool import Estimator, VTraceTarget, VTraceGradients, CompiledModel
 from MDP import Game, State, InfoSet, Leaf, ActionSchema
 
 size = 5
@@ -120,9 +120,9 @@ def grid_world_exploration_function(action_schema: ActionSchema) -> ActionSchema
     return GridWorldActionSchema(smoothed_dist)
 
 
-class GridWorldNetwork(tf.keras.Model):
-    def __init__(self, num_layers: int, dff: int, outputs: int):
-        super().__init__()
+class GridWorldNetwork(CompiledModel):
+    def __init__(self, optimizer, num_layers: int, dff: int, outputs: int):
+        super().__init__(optimizer)
 
         self.internal_layers = []
         self.internal_layer_norms = [tf.keras.layers.LayerNormalization()]
@@ -164,28 +164,27 @@ class GridWorldNetwork(tf.keras.Model):
 
 class GridWorldEstimator(Estimator):
     def __init__(self):
-        self.weight_decay = 1e-4
-        self.internal_network_policy = GridWorldNetwork(num_layers=5, dff=100, outputs=4)
-        self.internal_network_value = GridWorldNetwork(num_layers=5, dff=100, outputs=1)
-        self.optimizer_policy = tfa.optimizers.SGDW(
-            weight_decay=self.weight_decay,
-            learning_rate=0.005,
-            momentum=0.9,
-            nesterov=True,
+        weight_decay = 1e-4
+        optimizer_policy = tfa.optimizers.AdamW(
+            weight_decay=weight_decay,
+            learning_rate=0.001,
         )
-        self.optimizer_value = tfa.optimizers.SGDW(
-            weight_decay=self.weight_decay,
-            learning_rate=0.005,
-            momentum=0.9,
-            nesterov=True,
+        optimizer_value = tfa.optimizers.AdamW(
+            weight_decay=weight_decay,
+            learning_rate=0.001,
         )
+
+        value_network = GridWorldNetwork(num_layers=5, dff=100, outputs=1, optimizer=optimizer_value)
+        policy_network = GridWorldNetwork(num_layers=5, dff=100, outputs=4, optimizer=optimizer_policy)
+
+        super().__init__(value_network, policy_network)
 
         self.version = 0
 
     def get_variables(self) -> List[tf.Variable]:
         result = []
-        result += self.internal_network_value.trainable_variables
-        result += self.internal_network_policy.trainable_variables
+        result += self.value_network.trainable_variables
+        result += self.policy_network.trainable_variables
         return result
 
     def info_set_to_vector(self, info_set: InfoSet):
@@ -198,57 +197,13 @@ class GridWorldEstimator(Estimator):
 
     def evaluate(self, info_sets: List[InfoSet]) -> List[Tuple[tf.Tensor, ActionSchema]]:
         batch = [self.info_set_to_vector(info_set) for info_set in info_sets]
-        output_policy = self.internal_network_policy(tf.stack(batch))
+        output_policy = self.policy_network(tf.stack(batch))
         action_schemas: List[ActionSchema] = [
             self.vector_to_action_schema(vector) for vector in tf.unstack(output_policy)
         ]
-        output_value = self.internal_network_value(tf.stack(batch))
+        output_value = self.value_network(tf.stack(batch))
         values = tf.unstack(output_value, axis=0)
         return list(zip(values, action_schemas))
-
-    def compute_gradients(self, targets: List[VTraceTarget]) -> VTraceGradients:
-        with tf.GradientTape(persistent=True) as tape:
-            info_sets, reach_weights, value_targets, q_value_targets = zip(*targets)
-            value_estimates, on_policy_action_schemas = zip(*self.evaluate(info_sets))
-
-            value_losses = reach_weights * tf.keras.losses.huber(
-                y_pred=tf.stack(value_estimates), y_true=tf.stack(value_targets)
-            )
-            value_loss = tf.reduce_mean(value_losses)
-
-            policy_losses = []
-            for i in range(len(targets)):
-                local_policy_losses = []
-                action_schema = on_policy_action_schemas[i]
-                assert isinstance(action_schema, GridWorldActionSchema)
-                value_estimate = value_estimates[i]
-                for action, importance, q_value in q_value_targets[i]:
-                    advantage = q_value - value_estimate
-                    on_policy_log_prob = action_schema.log_prob(action)
-                    policy_loss = importance * on_policy_log_prob * advantage
-                    local_policy_losses.append(policy_loss)
-                policy_losses.append(-tf.reduce_mean(tf.stack(local_policy_losses)))
-
-            policy_loss = tf.reduce_mean(reach_weights * tf.stack(policy_losses))
-
-        tv = self.internal_network_value.trainable_variables
-        value_grads = tape.gradient(value_loss, tv)
-
-        tp = self.internal_network_policy.trainable_variables
-        policy_grads = tape.gradient(policy_loss, tp)
-
-        return value_grads, policy_grads
-
-    def apply_gradients(self, grads: VTraceGradients):
-        value_grads, policy_grads = grads
-
-        tv = self.internal_network_value.trainable_variables
-        value_grads, _ = tf.clip_by_global_norm(value_grads, 5.0)
-        self.optimizer_value.apply_gradients(zip(value_grads, tv))
-
-        tp = self.internal_network_policy.trainable_variables
-        policy_grads, _ = tf.clip_by_global_norm(policy_grads, 5.0)
-        self.optimizer_policy.apply_gradients(zip(policy_grads, tp))
 
     def save(self, checkpoint_location: str) -> None:
         value_net_location = os.path.dirname(checkpoint_location) + "/data/value"
@@ -262,8 +217,8 @@ class GridWorldEstimator(Estimator):
         while success is False:
             try:
                 os.makedirs(os.path.dirname(value_net_location), exist_ok=True)
-                self.internal_network_value.save_weights(value_net_location)
-                self.internal_network_policy.save_weights(policy_net_location)
+                self.value_network.save_weights(value_net_location)
+                self.policy_network.save_weights(policy_net_location)
                 with open(checkpoint_location, 'w') as f:
                     f.write(checkpoint_object)
                 success = True
@@ -273,8 +228,8 @@ class GridWorldEstimator(Estimator):
                 sleep(1)
 
     def load(self, checkpoint_location: str, blocking: bool = True) -> None:
-        self.internal_network_value(tf.zeros(shape=(1, 2)))
-        self.internal_network_policy(tf.zeros(shape=(1, 2)))
+        self.policy_network(tf.zeros(shape=(1, 2)))
+        self.value_network(tf.zeros(shape=(1, 2)))
         success = False
         while success is False:
             try:
@@ -284,8 +239,8 @@ class GridWorldEstimator(Estimator):
                     version = checkpoint["version"]
                     if self.version != version:
                         tf.print("loaded new version")
-                        self.internal_network_value.load_weights(checkpoint["value_net_location"])
-                        self.internal_network_policy.load_weights(checkpoint["policy_net_location"])
+                        self.value_network.load_weights(checkpoint["value_net_location"])
+                        self.policy_network.load_weights(checkpoint["policy_net_location"])
                         self.version = version
                     success = True
             except:

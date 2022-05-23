@@ -31,7 +31,7 @@ allowed_discrete_actions_per_symbol = [
     +1000, +9999999999999,
     -1000, -9999999999999,
 ]
-days_skipped_after_action = 30
+days_skipped_after_action = 3 * 30
 
 max_budget_at_start = 10000
 min_budget_at_start = max(0.0, min([i for i in allowed_discrete_actions_per_symbol if i > 0]))
@@ -341,18 +341,31 @@ class StockWorld(Game):
                 quantity = allowed_discrete_actions_per_symbol[action_id]
 
                 tf.print(f'{symbol} : {quantity}')
+
+        traj_random = create_trajectory(
+            StockWorld, root_state, root_info,
+            StockWorldBaselineEstimator(), identity_exploration_function, max_trajectory_length,
+        )
+
         # write out the trajectory
         reward = traj[-1][0].worth - start_worth
-        tf.print(f'estimator made: {reward}')
+        reward_random = traj_random[-1][0].worth - start_worth
+        tf.print(f'{reward} (policy) vs. {reward_random} (random)')
 
         global performance_history_length
         global performance_history
         if len(performance_history) > 100:
             performance_history.pop(0)
-        performance_history.append(reward)
+        performance_history.append(
+            [reward, reward_random]
+        )
 
-        mean_reward = tf.reduce_mean(performance_history)
-        tf.print(f'mean reward over last {performance_history_length} tests: {mean_reward}')
+        performance_history_tensor = tf.constant(performance_history)
+        mean_reward = tf.reduce_mean(performance_history_tensor[:, 0])
+        mean_reward_random = tf.reduce_mean(performance_history_tensor[:, 1])
+        tf.print(
+            f'mean reward over last {performance_history_length} tests: {mean_reward} (policy) vs. {mean_reward_random} (random)'
+        )
 
 
 performance_history = []
@@ -763,7 +776,7 @@ class StockWorldPolicyNetwork(tf.keras.Model):
 
 class StockWorldEstimator(Estimator):
     def __init__(self):
-        self.weight_decay = 0.0
+        self.weight_decay = 0.0000001
 
         self.network_value = StockWorldValueNetwork()
         self.network_policy = StockWorldPolicyNetwork()
@@ -774,6 +787,7 @@ class StockWorldEstimator(Estimator):
             momentum=0.9,
             nesterov=True,
         )
+
         self.optimizer_policy = tfa.optimizers.SGDW(
             weight_decay=self.weight_decay,
             learning_rate=0.0005,
@@ -817,7 +831,7 @@ class StockWorldEstimator(Estimator):
         with tf.GradientTape(persistent=True) as tape:
             info_sets, reach_weights, value_targets, q_value_targets = zip(*targets)
             value_estimates, on_policy_action_schemas = zip(*self.evaluate(info_sets, training=True))
-            value_losses = reach_weights * tf.keras.metrics.mean_squared_error(
+            value_losses = reach_weights * tf.keras.losses.huber(
                 y_pred=tf.stack(value_estimates), y_true=tf.stack(value_targets)
             )
             value_loss = tf.reduce_mean(value_losses)
