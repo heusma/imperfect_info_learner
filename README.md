@@ -1,4 +1,3 @@
 # Imperfect Information Learner
 
-Eine per MPI Ring-Allreduce verteilte version von [V-Trace](https://arxiv.org/abs/1802.01561) V-Trace für Spiele mit belive states. <br/>
-Der wichtigste Teil des Programms steckt in [EvaluationTools.py](./EvaluationTool.py).
+This is a distributed version of [V-Trace](https://arxiv.org/abs/1802.01561) for games with belive states, using MPI Ring-Allreduce. The most important part of the programme lies in [EvaluationTools.py](./EvaluationTool.py).
